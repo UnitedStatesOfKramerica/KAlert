@@ -38,8 +38,8 @@ S = requests.Session()
 S.headers["User-Agent"] = "kalshi-board/1.0"
 STATE_PATH, SITE = "state.json", "site"
 KIND_NAME = {"arb": "Riskless", "sum": "Riskless", "shape": "Likely mispriced",
-             "book": "Sportsbook gap", "cheap": "Cheap offer"}
-CONF = {"arb": 1.0, "sum": 1.0, "shape": 0.5, "book": 0.6, "cheap": 0.3}
+             "book": "Sportsbook gap", "cheap": "Cheap offer", "tier": "Riskless", "flat": "Same price, more coverage"}
+CONF = {"arb": 1.0, "sum": 1.0, "tier": 1.0, "shape": 0.5, "book": 0.6, "cheap": 0.3, "flat": 0.4}
 
 
 # ---------- Kalshi API ----------
@@ -176,14 +176,21 @@ def strike_of(m):
 
 
 # ---------- ladders ----------
+def subject_key(m):
+    """Wording of the market with every number blanked, so 'Gibbs: 25+' and 'Strong Jr.: 20+' differ
+    but 'Above 45' and 'Above 50' match."""
+    txt = (m.get("yes_sub_title") or m.get("title") or "").lower()
+    return re.sub(r"-?\d[\d,]*\.?\d*", "#", txt).strip()
+
+
 def build_ladders(markets):
     groups = {}
     for m in markets:
         s = strike_of(m)
         if s:
-            groups.setdefault((m["_event"], s[0]), []).append((s[1], m))
+            groups.setdefault((m["_event"], s[0], subject_key(m)), []).append((s[1], m))
     ladders = []
-    for (ev, d), items in groups.items():
+    for (ev, d, _subj), items in groups.items():
         if len(items) < 2:
             continue
         items.sort(key=lambda x: x[0])
@@ -245,6 +252,53 @@ def analyze(L, a):
     return out
 
 
+def flat_candidates(L, a):
+    """A lower threshold that costs the same as (or less than) the next higher one, although it pays in more cases."""
+    legs = [l for l in L["legs"] if l["bid"] is not None and l["ask"] is not None
+            and l["ask"] - l["bid"] <= a.max_spread]
+    if len(legs) < 2:
+        return []
+    mids = [(l["bid"] + l["ask"]) / 2 for l in legs]
+    dens = [max(0, mids[i] - mids[i + 1]) / (legs[i + 1]["k"] - legs[i]["k"]) for i in range(len(legs) - 1)]
+    out = []
+    for i in range(len(legs) - 1):
+        lo, hi = legs[i], legs[i + 1]
+        if lo["ask"] > hi["ask"]:
+            continue
+        q = 0.0   # extra coverage: single-peak estimate from the ranges either side (mid prices)
+        if 0 < i < len(dens) - 1:
+            q = min(max(dens[:i]), max(dens[i + 1:])) * (hi["k"] - lo["k"])
+        far = max([mids[j] for j in range(i + 2, len(legs))] or [0])
+        fair = max(mids[i + 1] + q, far)
+        edge = fair - lo["ask"] - fee_c(lo["ask"])
+        if edge >= a.flat_min_edge:
+            out.append({"kind": "flat", "L": L, "lo": dict(lo), "hi": dict(hi), "q": q, "est": edge})
+    return out
+
+
+def flat_item(c, a):
+    L, lo, hi, q = c["L"], c["lo"], c["hi"], c["q"]
+    if lo["ask"] is None or hi["bid"] is None or hi["ask"] is None:
+        return None
+    mid_hi = (hi["bid"] + hi["ask"]) / 2
+    fair = mid_hi + q
+    edge = fair - lo["ask"] - fee_c(lo["ask"])
+    size = lo["aq"]
+    if lo["ask"] > hi["ask"] or edge < a.flat_min_edge or size < a.min_size or edge * size / 100 < a.flat_min_profit:
+        return None
+    k1, k2 = fk(lo["k"]), fk(hi["k"])
+    action = "Buy NO" if lo["flip"] else "Buy YES"
+    return {"id": f"{lo['ticker']}|flat|{hi['ticker']}", "kind": "flat", "cat": L["cat"], "title": L["title"],
+            "headline": f"\u201c{lo['label']}\u201d costs {lo['ask']}¢, the same as \u201c{hi['label']}\u201d ({hi['ask']}¢)",
+            "why": (f"\u201c{lo['label']}\u201d pays in every case \u201c{hi['label']}\u201d does, and also when the result lands "
+                    f"between {k1} and {k2}, so it should cost more. Using the {mid_hi:.1f}¢ price of \u201c{hi['label']}\u201d as the "
+                    f"reference, it should be worth at least about {fair:.1f}¢ (roughly {q:.1f}¢ for the extra range). "
+                    f"It can be bought for {lo['ask']}¢. If you were going to buy \u201c{hi['label']}\u201d, buy this one instead."),
+            "legs": [{"action": action, "ticker": lo["ticker"], "label": lo["label"], "price": lo["ask"], "qty": size}],
+            "edge": round(edge, 2), "size": size, "profit": round(edge * size / 100, 2), "risk": 0, "fair": round(fair, 1),
+            "url": f"https://kalshi.com/markets/{L['series'].lower()}" if L["series"] else ""}
+
+
 def apply_book(leg, book):
     yes, no = book
     yb = yes[0][0] if yes else None
@@ -300,45 +354,183 @@ def band_item(c, a):
             "url": f"https://kalshi.com/markets/{L['series'].lower()}" if L["series"] else ""}
 
 
-# ---------- exclusive-outcome sums ----------
-def sum_candidates(me_events, a):
+def ladder_view(ladders, a):
+    """All threshold ladders that have at least one flat step (adjacent tiers priced within a tick of each other)."""
     out = []
-    for e, ms in me_events:
-        if not (2 <= len(ms) <= 30) or any(strike_of(m) for m in ms):
+    for L in ladders:
+        legs = [l for l in L["legs"] if l["bid"] is not None and l["ask"] is not None
+                and l["ask"] - l["bid"] <= a.max_spread]
+        if len(legs) < 3:
+            continue
+        steps, span = [], (legs[-1]["k"] - legs[0]["k"]) or 1
+        for lo, hi in zip(legs, legs[1:]):
+            m_lo, m_hi = (lo["bid"] + lo["ask"]) / 2, (hi["bid"] + hi["ask"]) / 2
+            cost = lo["ask"] - hi["bid"]
+            fees = fee_c(lo["ask"]) + fee_c(100 - hi["bid"])
+            dead = (m_lo >= 98.5 and m_hi >= 98.5) or (m_lo <= 1.5 and m_hi <= 1.5)
+            steps.append({"lo": fk(lo["k"]), "hi": fk(hi["k"]), "prob": round(m_lo - m_hi, 1),
+                          "breakeven": round(cost + fees, 1), "w": hi["k"] - lo["k"],
+                          "flat": (m_lo - m_hi) <= 1.0 and not dead})
+        flat = [x for x in steps if x["flat"]]
+        if not flat:
+            continue
+        share = sum(x["w"] for x in flat) / span
+        out.append({"cat": L["cat"], "title": L["title"], "flat": len(flat), "share": round(share, 2),
+                    "tiers": [{"label": l["label"], "bid": l["bid"], "ask": l["ask"]} for l in legs], "steps": steps,
+                    "url": f"https://kalshi.com/markets/{L['series'].lower()}" if L["series"] else ""})
+    out.sort(key=lambda x: (x["share"], x["flat"]), reverse=True)
+    return out[:150]
+
+
+# ---------- sets ("at most N can pay") and rank tiers ----------
+CONFLICT = {"yards", "yds", "touchdowns", "receptions", "sacks", "interceptions", "rushing", "receiving",
+            "passing", "goals", "assists", "rebounds", "steals", "blocks", "strikeouts", "homers", "saves"}
+
+
+def event_n(e, ms):
+    """Most outcomes of this event that can resolve YES: 1 if exclusive, N for 'top N' sets, else None."""
+    if e.get("mutually_exclusive"):
+        return 1
+    text = norm(f"{e.get('title') or ''} {ms[0].get('title') or ''} {ms[0].get('rules_primary') or ''}")
+    r = re.search(r"\btop (\d+)\b", text)
+    return int(r.group(1)) if r else None
+
+
+def field_list(evs):
+    """Events that are a field of different subjects (players, teams, candidates) with a known maximum N."""
+    out = []
+    for e, ms in evs:
+        if not (3 <= len(ms) <= 80) or any(strike_of(m) for m in ms):
+            continue
+        n = event_n(e, ms)
+        if n is None:
+            continue
+        subj = {}
+        for m in ms:
+            k = norm_name(m["_sub"] or m["_title"])
+            if k and k not in subj:
+                subj[k] = m
+        if len(subj) < 3:
+            continue
+        text = norm(f"{e.get('title') or ''} {ms[0].get('title') or ''} {ms[0].get('rules_primary') or ''}")
+        out.append({"e": e, "N": n, "subj": subj, "cat": ms[0]["_cat"], "title": ms[0]["_title"],
+                    "series": ms[0]["_series"], "conflict": frozenset(set(text.split()) & CONFLICT)})
+    return out
+
+
+def sets_info(fl):
+    out = []
+    for f in fl:
+        ms = list(f["subj"].values())
+        q = [quotes(m) for m in ms]
+        both = [(b, x) for b, x in q if b and x]
+        if len(both) < 3:
+            continue
+        sb, sa = sum(b for b, _ in q if b), sum(x for _, x in q if x)
+        mid = sum((b + x) / 2 for b, x in both)
+        limit = 100 * f["N"]
+        dev = (mid - limit) / limit
+        if sb > limit:
+            note = "Bids add up to more than the limit. That cannot be right, and selling every one is riskless if the sizes allow."
+        elif mid < 0.6 * limit:
+            note = (f"Prices add up to only {mid / limit * 100:.0f}% of the limit. Either unlisted contenders take "
+                    f"many of the spots, or this field is cheap.")
+        else:
+            note = f"Prices add up to {mid / limit * 100:.0f}% of the limit, which is normal."
+        out.append({"cat": f["cat"], "title": f["title"], "N": f["N"], "n": len(ms), "sum_bid": sb, "sum_ask": sa,
+                    "limit": limit, "dev": round(dev, 3), "note": note,
+                    "url": f"https://kalshi.com/markets/{f['series'].lower()}" if f["series"] else ""})
+    out.sort(key=lambda s: abs(s["dev"]), reverse=True)
+    return out[:150]
+
+
+def sum_candidates(fl, a):
+    """At most N of the listed outcomes can pay, so YES bids must add up to <= 100*N."""
+    out = []
+    for f in fl:
+        ms = [m for m in f["subj"].values() if quotes(m)[0]]
+        if len(ms) <= f["N"]:
             continue
         q = [quotes(m)[0] for m in ms]
-        if not all(q):
-            continue
-        edge = sum(q) - 100 - sum(fee_c(x) for x in q)
+        edge = sum(q) - 100 * f["N"] - sum(fee_c(x) for x in q)
         if edge >= a.min_edge:
-            out.append({"kind": "sum", "e": e, "ms": ms, "est": edge})
+            out.append({"kind": "sum", "f": f, "ms": ms, "N": f["N"], "est": edge})
     return out
 
 
 def sum_item(c, books, a):
-    ms, legs, bids = c["ms"], [], []
-    for m in ms:
+    f, N, bids = c["f"], c["N"], []
+    for m in c["ms"]:
         yes, _ = books[m["ticker"]]
-        if not yes:
-            return None
-        bids.append((m, yes[0][0], yes[0][1]))
+        if yes:
+            bids.append((m, yes[0][0], yes[0][1]))
+    n = len(bids)
+    if n <= N:
+        return None
     sumb = sum(b for _, b, _ in bids)
-    edge = sumb - 100 - sum(fee_c(b) for _, b, _ in bids)
+    edge = sumb - 100 * N - sum(fee_c(b) for _, b, _ in bids)
     size = min(q for _, _, q in bids)
     if edge < a.min_edge or size < a.min_size:
         return None
-    n = len(bids)
     legs = [{"action": "Buy NO", "ticker": m["ticker"], "label": m["_sub"] or m["_title"],
              "price": 100 - b, "qty": q} for m, b, q in bids]
-    m0 = ms[0]
-    return {"id": f"{c['e'].get('event_ticker')}|sum", "kind": "sum", "cat": m0["_cat"], "title": m0["_title"],
-            "headline": f"{n} exclusive outcomes add up to {sumb}¢ (over 100¢)",
-            "why": (f"Only one of these outcomes can happen, yet the YES bids add up to {sumb}¢. Buying NO on all "
-                    f"of them costs {100 * n - sumb}¢ per set and pays at least {100 * (n - 1)}¢, "
-                    f"locking in about {edge:.1f}¢ per set after fees."),
+    word = "can win" if N == 1 else f"can finish in the top {N}" if "top" in norm(f["title"]) else f"can pay"
+    return {"id": f"{f['e'].get('event_ticker')}|sum", "kind": "sum", "N": N, "cat": f["cat"], "title": f["title"],
+            "headline": f"At most {N} of {n} outcomes can pay, but YES bids add up to {sumb}¢ (limit {100 * N}¢)",
+            "why": (f"Only {N} of these {n} outcomes {word}, so their YES prices should never add up to more than "
+                    f"{100 * N}¢. They add up to {sumb}¢. Buying NO on all of them costs {100 * n - sumb}¢ per set and "
+                    f"pays at least {100 * (n - N)}¢, locking in about {edge:.1f}¢ per set after fees."),
             "legs": legs, "edge": round(edge, 2), "size": size, "profit": round(edge * size / 100, 2),
             "risk": 0, "fair": 0,
-            "url": f"https://kalshi.com/markets/{m0['_series'].lower()}" if m0["_series"] else ""}
+            "url": f"https://kalshi.com/markets/{f['series'].lower()}" if f["series"] else ""}
+
+
+def tier_candidates(fl, a):
+    """Same subject in two sets with different N (e.g. top 1 and top 10): P(top small) <= P(top big)."""
+    out, pool = [], [f for f in fl if len(f["subj"]) >= 5]
+    for A in pool:
+        for B in pool:
+            if A["N"] >= B["N"] or A["cat"] != B["cat"] or A["conflict"] != B["conflict"]:
+                continue
+            shared = A["subj"].keys() & B["subj"].keys()
+            if len(shared) < 5 or len(shared) < 0.5 * min(len(A["subj"]), len(B["subj"])):
+                continue
+            for s in shared:
+                ma, mb = A["subj"][s], B["subj"][s]
+                bid_small, ask_big = quotes(ma)[0], quotes(mb)[1]
+                if bid_small is None or ask_big is None:
+                    continue
+                edge = -(ask_big - bid_small) - fee_c(ask_big) - fee_c(100 - bid_small)
+                if edge >= a.min_edge:
+                    leg = lambda m: {"ticker": m["ticker"], "label": m["_sub"] or m["_title"], "bid": None,
+                                     "ask": None, "flip": False, "bq": 0, "aq": 0}
+                    out.append({"kind": "tier", "est": edge, "A": A, "B": B, "name": ma["_sub"] or s,
+                                "small": leg(ma), "big": leg(mb)})
+    return out
+
+
+def tier_item(c, a):
+    sm, bg, A, B = c["small"], c["big"], c["A"], c["B"]
+    if sm["bid"] is None or bg["ask"] is None:
+        return None
+    cost = bg["ask"] - sm["bid"]
+    edge = -cost - fee_c(bg["ask"]) - fee_c(100 - sm["bid"])
+    size = min(bg["aq"], sm["bq"])
+    if edge < a.min_edge or size < a.min_size:
+        return None
+    return {"id": f"{sm['ticker']}|{bg['ticker']}|tier", "kind": "tier", "cat": A["cat"],
+            "title": f"{c['name']}: top {A['N']} vs top {B['N']}",
+            "headline": f"Priced higher to finish top {A['N']} than top {B['N']}",
+            "why": (f"Finishing in the top {A['N']} means finishing in the top {B['N']}, so the top-{A['N']} price can "
+                    f"never be above the top-{B['N']} price. The two legs together cost {100 + cost:.0f}¢ and pay at "
+                    f"least 100¢ in every outcome, locking in about {edge:.1f}¢ per contract after fees. "
+                    f"Check that both markets use the same ranking source and season."),
+            "legs": [{"action": "Buy YES", "ticker": bg["ticker"], "label": f"{bg['label']} (top {B['N']})",
+                      "price": bg["ask"], "qty": bg["aq"]},
+                     {"action": "Buy NO", "ticker": sm["ticker"], "label": f"{sm['label']} (top {A['N']})",
+                      "price": 100 - sm["bid"], "qty": sm["bq"]}],
+            "edge": round(edge, 2), "size": size, "profit": round(edge * size / 100, 2), "risk": 0, "fair": 0,
+            "url": f"https://kalshi.com/markets/{A['series'].lower()}" if A["series"] else ""}
 
 
 # ---------- sportsbook odds (optional, needs ODDS_API_KEY) ----------
@@ -654,11 +846,142 @@ def new_markets(markets, a, now):
     return out[:a.new_keep]
 
 
+# ---------- spikes: sudden moves to fade (anti-momentum) ----------
+def cc(d, key):
+    if not isinstance(d, dict):
+        return None
+    v = d.get(key)
+    if v is not None:
+        return float(v)
+    v = d.get(key + "_dollars")
+    return float(v) * 100 if v is not None else None
+
+
+def candle_mid(c):
+    b, x = cc(c.get("yes_bid"), "close"), cc(c.get("yes_ask"), "close")
+    if b is not None and x is not None and b > 0 and x < 100:
+        return (b + x) / 2
+    return cc(c.get("price"), "close")
+
+
+def hourly(ticker, series, now):
+    d = get(f"/series/{series}/markets/{ticker}/candlesticks",
+            {"start_ts": int(now - 48 * 3600), "end_ts": int(now), "period_interval": 60})
+    out = []
+    for c in d.get("candlesticks", []):
+        mid = candle_mid(c)
+        vol = c.get("volume", c.get("volume_fp", 0)) or 0
+        if mid is not None:
+            out.append((c.get("end_period_ts", 0), mid, float(vol)))
+    out.sort()
+    return out
+
+
+def detect_spikes(markets, state, now, a, ctx, fetch_book, books):
+    base_old = state.get("base", {})
+    cur, dev, base_new, by_t, by_event = {}, {}, {}, {}, {}
+    for m in markets:
+        yb, ya = quotes(m)
+        mid = (yb + ya) / 2 if (yb and ya) else (cents(m, "last_price") or None)
+        if not mid:
+            continue
+        t = m["ticker"]
+        b0 = base_old.get(t, mid)
+        cur[t], dev[t], by_t[t] = mid, mid - b0, m
+        base_new[t] = round(b0 + a.spike_alpha * (mid - b0), 1)
+        by_event.setdefault(m["_event"], []).append(t)
+    ctx["base"] = base_new
+
+    # keep the track record up to date: how far did each logged spike retrace after 1h / 6h / 24h?
+    log = [e for e in state.get("spike_log", []) if now - e["t"] < 14 * 86400]
+    for e in log:
+        for h in (1, 6, 24):
+            k = f"r{h}"
+            if k not in e and now - e["t"] >= h * 3600 and e["ticker"] in cur and e["now"] != e["base"]:
+                e[k] = round((e["now"] - cur[e["ticker"]]) / (e["now"] - e["base"]), 2)
+    logged = {e["id"] for e in log}
+
+    cands = sorted(((abs(d), t) for t, d in dev.items() if abs(d) >= a.spike_min * 0.6 and by_t[t]["_series"]),
+                   reverse=True)[:a.spike_verify]
+    spikes = []
+    for _, t in cands:
+        m = by_t[t]
+        try:
+            h = hourly(t, m["_series"], now)
+        except Exception as ex:
+            ctx["spike_err"] = f"{type(ex).__name__}: {ex}"[:150]
+            continue
+        base_pts = [mid for ts_, mid, _ in h if ts_ < now - 6 * 3600]
+        if len(h) < 8 or len(base_pts) < 4:
+            continue
+        baseline, now_mid = median(base_pts), cur[t]
+        move = now_mid - baseline
+        if abs(move) < a.spike_min:
+            continue
+        hrs = 0
+        for _, mid, _ in reversed(h):
+            if abs(mid - baseline) <= 5:
+                break
+            hrs += 1
+        if hrs > a.spike_max_hours:
+            continue
+        vol_move = sum(v for _, _, v in h[-(hrs + 1):])
+        thin = vol_move <= a.spike_thin
+        sibs = [x for x in by_event.get(m["_event"], []) if x != t and abs(dev.get(x, 0)) >= 6]
+        iso = not sibs
+        sid = f"{t}|{int(now // 43200)}"
+        if sid not in logged and not any(e["ticker"] == t and now - e["t"] < 12 * 3600 for e in log):
+            log.append({"id": sid, "t": now, "ticker": t, "cat": m["_cat"], "dir": "up" if move > 0 else "down",
+                        "base": round(baseline, 1), "now": round(now_mid, 1), "thin": thin, "iso": iso})
+            logged.add(sid)
+        if not fetch_book(t):
+            continue
+        yes, no = books[t]
+        yb = yes[0][0] if yes else None
+        ya = 100 - no[0][0] if no else None
+        if yb is None or ya is None or ya - yb > a.spike_max_spread:
+            continue
+        s, target = ya - yb, (now_mid + baseline) / 2
+        if move > 0:    # price jumped: fade it by buying NO
+            action, price, qty = "Buy NO", 100 - yb, yes[0][1]
+            gain = yb - (target + s / 2) - fee_c(price) - fee_c(100 - target - s / 2)
+        else:           # price crashed: fade it by buying YES
+            action, price, qty = "Buy YES", ya, no[0][1]
+            gain = (target - s / 2) - ya - fee_c(price) - fee_c(target - s / 2)
+        if gain < a.spike_min_gain or qty < a.min_size:
+            continue
+        rank = abs(move) * (1.0 if thin else 0.5) * (1.0 if iso else 0.6)
+        spikes.append({"id": sid, "ticker": t, "cat": m["_cat"], "title": m["_title"], "sub": m["_sub"],
+                       "dir": "up" if move > 0 else "down", "base": round(baseline), "now": round(now_mid),
+                       "move": round(move), "hours": hrs, "vol_move": round(vol_move), "thin": thin, "iso": iso,
+                       "related": len(sibs), "target": round(target), "gain": round(gain, 1), "risk": price,
+                       "breakeven": round(100 * price / (price + gain)), "rank": round(rank, 1),
+                       "legs": [{"action": action, "ticker": t, "label": m["_sub"] or m["_title"], "price": price, "qty": qty}],
+                       "url": f"https://kalshi.com/markets/{m['_series'].lower()}" if m["_series"] else ""})
+    spikes.sort(key=lambda x: x["rank"], reverse=True)
+    ctx["spike_log"] = log[-500:]
+    ctx["spike_stats"] = spike_stats(log)
+    return spikes
+
+
+def spike_stats(log):
+    def agg(rows, h):
+        v = sorted(e[f"r{h}"] for e in rows if f"r{h}" in e)
+        if not v:
+            return None
+        return {"n": len(v), "median": round(median(v) * 100),
+                "half": round(100 * sum(1 for x in v if x >= 0.5) / len(v)),
+                "worse": round(100 * sum(1 for x in v if x < 0) / len(v))}
+    groups = {"all": log, "thin_iso": [e for e in log if e["thin"] and e["iso"]],
+              "other": [e for e in log if not (e["thin"] and e["iso"])]}
+    return {g: {"count": len(rows), **{f"h{h}": agg(rows, h) for h in (1, 6, 24)}} for g, rows in groups.items()}
+
+
 # ---------- scan ----------
 def scan(a, state, now, ctx):
     events = fetch_events()
     cats = category_map(events)
-    markets, me_events = [], []
+    markets, evs = [], []
     for e in events:
         cat = e.get("category") or cats.get(e.get("series_ticker")) or "Other"
         ms = []
@@ -668,15 +991,18 @@ def scan(a, state, now, ctx):
             m["_title"], m["_sub"] = describe(e, m)
             ms.append(m)
         markets += ms
-        if e.get("mutually_exclusive"):
-            me_events.append((e, ms))
+        evs.append((e, ms))
     print("strike types:", dict(Counter((m.get("strike_type") or "none") for m in markets).most_common(8)))
 
     ladders = build_ladders(markets)
     cands = []
     for L in ladders:
         cands += analyze(L, a)
-    cands += sum_candidates(me_events, a)
+    ctx["ladders"] = ladder_view(ladders, a)
+    fl = field_list(evs)
+    ctx["sets"] = sets_info(fl)
+    cands += sum_candidates(fl, a)
+    cands += tier_candidates(fl, a)
 
     books_info = {"enabled": False}
     key = os.environ.get("ODDS_API_KEY")
@@ -701,8 +1027,12 @@ def scan(a, state, now, ctx):
             books_info["error"] = f"{type(ex).__name__}: {ex}"[:200]
         print("sportsbooks:", {k: v for k, v in books_info.items() if k not in ("unmatched", "odds_sample")})
 
+    flats = []
+    for L in ladders:
+        flats += flat_candidates(L, a)
+    flats.sort(key=lambda c: c["est"], reverse=True)
     cands.sort(key=lambda c: c["est"], reverse=True)
-    cands = cands[:a.max_books]
+    cands = cands[:a.max_books] + flats[:a.flat_books]
     print(f"{len(ladders)} ladders, {len(cands)} candidates to verify")
 
     need = []
@@ -711,6 +1041,10 @@ def scan(a, state, now, ctx):
             ts_ = [c["lo"]["ticker"], c["hi"]["ticker"]]
         elif c["kind"] == "sum":
             ts_ = [m["ticker"] for m in c["ms"]]
+        elif c["kind"] == "tier":
+            ts_ = [c["small"]["ticker"], c["big"]["ticker"]]
+        elif c["kind"] == "flat":
+            ts_ = [c["lo"]["ticker"], c["hi"]["ticker"]]
         else:
             ts_ = [c["leg"]["ticker"]]
         c["tickers"] = ts_
@@ -747,6 +1081,14 @@ def scan(a, state, now, ctx):
             it = band_item(c, a)
         elif c["kind"] == "sum":
             it = sum_item(c, books, a)
+        elif c["kind"] == "flat":
+            apply_book(c["lo"], books[c["lo"]["ticker"]])
+            apply_book(c["hi"], books[c["hi"]["ticker"]])
+            it = flat_item(c, a)
+        elif c["kind"] == "tier":
+            apply_book(c["small"], books[c["small"]["ticker"]])
+            apply_book(c["big"], books[c["big"]["ticker"]])
+            it = tier_item(c, a)
         else:
             apply_book(c["leg"], books[c["leg"]["ticker"]])
             it = book_item(c, a)
@@ -754,7 +1096,11 @@ def scan(a, state, now, ctx):
             items.append(it)
 
     recent = [m for m in markets if (ts(m.get("open_time") or m.get("created_time") or "") or 0) >= now - a.new_hours * 3600]
-    pool = sorted(markets, key=lambda m: num(m, "volume_24h"), reverse=True)[:a.cheap_top] + recent[:30]
+    elig = sorted((m for m in markets if any(quotes(m))), key=lambda m: m["ticker"])
+    cur = (state.get("cursor", 0) % len(elig)) if elig else 0
+    sweep = (elig + elig)[cur:cur + a.cheap_sweep] if elig else []
+    ctx["cursor"] = (cur + a.cheap_sweep) % len(elig) if elig else 0
+    pool = sorted(markets, key=lambda m: num(m, "volume_24h"), reverse=True)[:a.cheap_top] + sweep + recent[:30]
     seen_t = set()
     for m in pool:
         if m["ticker"] in seen_t:
@@ -763,13 +1109,26 @@ def scan(a, state, now, ctx):
         if fetch_book(m["ticker"]):
             items += cheap_items(m, books[m["ticker"]], a)
 
+    spikes = []
+    try:
+        spikes = detect_spikes(markets, state, now, a, ctx, fetch_book, books)
+    except Exception as ex:
+        ctx["spike_err"] = f"{type(ex).__name__}: {ex}"[:150]
+        print("spike detection failed:", ctx["spike_err"])
+    ctx["spikes"] = spikes
+
     for it in items:
         it["conf"] = CONF[it["kind"]]
         it["score"] = round(it["profit"] * it["conf"], 2)
     items.sort(key=lambda x: x["score"], reverse=True)
     watch = new_markets(markets, a, now)
+    cat_stats = {}
+    for m in markets:
+        cat_stats.setdefault(m["_cat"], {"markets": 0, "ladders": 0, "flagged": 0})["markets"] += 1
+    for L in ladders:
+        cat_stats.setdefault(L["cat"], {"markets": 0, "ladders": 0, "flagged": 0})["ladders"] += 1
     return items, watch, {"events": len(events), "markets": len(markets), "ladders": len(ladders),
-                          "checked": len(cands), "books": books_info}
+                          "checked": len(cands), "books": books_info, "cats": cat_stats}
 
 
 # ---------- push ----------
@@ -794,14 +1153,28 @@ def main():
     ap.add_argument("--min-size", type=int, default=5, help="min contracts available at those prices")
     ap.add_argument("--max-spread", type=int, default=25, help="ignore ladder legs with wider spreads (cents)")
     ap.add_argument("--max-books", type=int, default=60, help="candidates to verify against order books")
-    ap.add_argument("--time-budget", type=int, default=200, help="seconds for order-book checks")
+    ap.add_argument("--time-budget", type=int, default=240, help="seconds for order-book checks")
     ap.add_argument("--push-min-profit", type=float, default=3.0, help="min score ($) to send a push")
     ap.add_argument("--keep", type=int, default=200)
+    ap.add_argument("--max-edge", type=float, default=60, help="drop anything with a bigger edge (cents): almost surely a data/matching error")
+    ap.add_argument("--flat-min-edge", type=float, default=0.2, help="min value gap (cents) to flag a same-price tier")
+    ap.add_argument("--flat-min-profit", type=float, default=0.25, help="min est. profit ($) for a same-price tier")
+    ap.add_argument("--flat-books", type=int, default=40, help="same-price tiers to verify per run")
     # cheap offers
     ap.add_argument("--ask-gap", type=int, default=15, help="cents between best offer and the next one")
     ap.add_argument("--cheap-max-size", type=int, default=500, help="max contracts at the cheap offer")
     ap.add_argument("--cheap-min-price", type=int, default=5, help="ignore offers below this many cents")
-    ap.add_argument("--cheap-top", type=int, default=80, help="most-traded markets to check for cheap offers")
+    ap.add_argument("--cheap-top", type=int, default=30, help="most-traded markets to always check for cheap offers")
+    ap.add_argument("--cheap-sweep", type=int, default=120, help="other markets checked per run, rotating through all of them")
+    # spikes (anti-momentum)
+    ap.add_argument("--spike-min", type=int, default=15, help="min move in cents vs the pre-spike level")
+    ap.add_argument("--spike-max-hours", type=int, default=12, help="ignore moves that started longer ago than this")
+    ap.add_argument("--spike-thin", type=int, default=150, help="contracts traded during the move to call it thin")
+    ap.add_argument("--spike-push", type=int, default=25, help="push alert for thin, unconfirmed spikes this big")
+    ap.add_argument("--spike-verify", type=int, default=25, help="biggest movers to check against price history")
+    ap.add_argument("--spike-alpha", type=float, default=0.08, help="how fast the baseline follows price (per scan)")
+    ap.add_argument("--spike-max-spread", type=int, default=12, help="skip spikes in markets with wider spreads")
+    ap.add_argument("--spike-min-gain", type=float, default=3.0, help="min gain in cents if it retraces halfway")
     # new markets
     ap.add_argument("--new-hours", type=float, default=6)
     ap.add_argument("--wide-spread", type=int, default=10)
@@ -809,7 +1182,7 @@ def main():
     # sportsbooks
     ap.add_argument("--book-min-edge", type=float, default=8.0, help="min gap vs sportsbooks, cents after fees")
     ap.add_argument("--min-books", type=int, default=3, help="min bookmakers agreeing on a line")
-    ap.add_argument("--odds-sports", default="basketball_nba,americanfootball_nfl,icehockey_nhl")
+    ap.add_argument("--odds-sports", default="", help="e.g. basketball_nba,americanfootball_nfl (off by default; costs credits)")
     ap.add_argument("--odds-interval", type=int, default=60, help="minutes between sportsbook refreshes")
     ap.add_argument("--odds-max-age", type=int, default=150, help="ignore sportsbook lines older than this (min)")
     ap.add_argument("--odds-horizon", type=float, default=12, help="hours ahead to fetch player props for")
@@ -834,22 +1207,38 @@ def main():
         print("scan error:", info["error"])
         items, watch = state.get("items", []), state.get("watch", [])
     info["duration"] = round(time.time() - t0, 1)
+    info["spike_err"] = ctx.get("spike_err")
 
+    cap = lambda it: a.max_edge * (it.get("N", 1) if it["kind"] == "sum" else 1)  # sets pay per full set
+    dropped = [it for it in items if it["edge"] > cap(it)]
+    if dropped:
+        print(f"dropped {len(dropped)} implausible items (edge too large):", [d["title"] for d in dropped][:5])
+    items = [it for it in items if it["edge"] <= cap(it)]
     fs = state.get("first_seen", {})
     for it in items:
         it["first_seen"] = fs.get(it["id"], now)
     items = items[:a.keep]
+    cats = info.setdefault("cats", {})
+    for it in items:
+        cats.setdefault(it["cat"], {"markets": 0, "ladders": 0, "flagged": 0})["flagged"] += 1
 
     pushed = {k: v for k, v in state.get("pushed", {}).items() if now - v < 86400}
     page_url = os.environ.get("PAGES_URL")
     if not info["error"]:
         fresh = [it for it in items if it["id"] not in pushed and it["score"] >= a.push_min_profit]
-        if fresh:
+        spk = [x for x in ctx.get("spikes", []) if x["thin"] and x["iso"] and abs(x["move"]) >= a.spike_push
+               and f"{x['ticker']}|spike|{int(now // 21600)}" not in pushed]
+        if fresh or spk:
             lines = [f"{KIND_NAME[it['kind']]} | {it['cat']} | {it['title'][:70]}\n"
                      f"{it['headline']}: +{it['edge']:.1f}¢ x {it['size']} = ${it['profit']:.2f}" for it in fresh[:5]]
             if len(fresh) > 5:
                 lines.append(f"+{len(fresh) - 5} more on the page")
-            push(f"Kalshi: {len(fresh)} new opportunit{'y' if len(fresh) == 1 else 'ies'}", "\n\n".join(lines), page_url)
+            for x in spk[:3]:
+                lines.append(f"Spike {x['dir']} | {x['cat']} | {x['title'][:60]}\n{x['base']}c to {x['now']}c on only "
+                             f"{x['vol_move']} contracts, no related market moved. Fade: {x['legs'][0]['action']} at {x['risk']}c.")
+                pushed[f"{x['ticker']}|spike|{int(now // 21600)}"] = now
+            n = len(fresh) + len(spk[:3])
+            push(f"Kalshi: {n} new item{'' if n == 1 else 's'}", "\n\n".join(lines), page_url)
             for it in fresh:
                 pushed[it["id"]] = now
 
@@ -862,10 +1251,15 @@ def main():
 
     json.dump({"items": items, "watch": watch, "first_seen": {it["id"]: it["first_seen"] for it in items},
                "pushed": pushed, "err_pushed": err_pushed,
-               "odds": ctx.get("odds", state.get("odds")), "odds_meter": ctx.get("odds_meter", state.get("odds_meter"))},
+               "odds": ctx.get("odds", state.get("odds")), "odds_meter": ctx.get("odds_meter", state.get("odds_meter")),
+               "cursor": ctx.get("cursor", state.get("cursor", 0)), "ladders": ctx.get("ladders", state.get("ladders", [])), "sets": ctx.get("sets", state.get("sets", [])),
+               "base": ctx.get("base", state.get("base", {})), "spike_log": ctx.get("spike_log", state.get("spike_log", [])),
+               "spikes": ctx.get("spikes", state.get("spikes", []))},
               open(STATE_PATH, "w", encoding="utf-8"), separators=(",", ":"))
     os.makedirs(SITE, exist_ok=True)
-    json.dump({"updated": now, "scan": info, "items": items, "watch": watch},
+    json.dump({"updated": now, "scan": info, "items": items, "watch": watch,
+               "sets": ctx.get("sets", state.get("sets", [])), "spikes": ctx.get("spikes", state.get("spikes", [])),
+               "ladders": ctx.get("ladders", state.get("ladders", [])), "spike_stats": ctx.get("spike_stats", spike_stats(state.get("spike_log", [])))},
               open(os.path.join(SITE, "board.json"), "w", encoding="utf-8"))
     open(os.path.join(SITE, "index.html"), "w", encoding="utf-8").write(PAGE)
     print(f"done: {len(items)} opportunities, {len(watch)} new markets, {info['ladders']} ladders, "
@@ -899,10 +1293,11 @@ details p{margin:8px 0 0;color:var(--muted)}
 .chip small{opacity:.65;margin-left:3px}
 .count{color:var(--muted);font-size:13px;margin:14px 0 8px}
 .card{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--blue);border-radius:10px;padding:12px 13px;margin-bottom:10px}
-.card.arb,.card.sum{border-left-color:var(--green)}
+.card.arb,.card.sum,.card.tier{border-left-color:var(--green)}
+.card.spike{border-left-color:var(--red)}.card.set{border-left-color:var(--muted)}.card.tier{border-left-color:var(--green)}
 .card.book{border-left-color:var(--purple)}.card.cheap{border-left-color:var(--amber)}.card.new{border-left-color:var(--teal)}
 .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:5px}
-.kind{font-weight:700;color:var(--blue)}.arb .kind,.sum .kind{color:var(--green)}
+.kind{font-weight:700;color:var(--blue)}.arb .kind,.sum .kind,.tier .kind{color:var(--green)}
 .book .kind{color:var(--purple)}.cheap .kind{color:var(--amber)}.new .kind{color:var(--teal)}
 .cat{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:1px 7px;color:var(--muted)}
 .age{margin-left:auto;color:var(--muted)}
@@ -927,12 +1322,17 @@ details p{margin:8px 0 0;color:var(--muted)}
 <div class="sub" id="sub">loading...</div>
 <details><summary>How to read this</summary>
 <p><b>Riskless</b>: trades that pay at least what they cost in every outcome, after fees (a higher threshold priced above a lower one, or exclusive outcomes whose YES bids add up past 100).</p>
+<p><b>Same price, more coverage</b>: a lower threshold (say "above 50") costs the same as a higher one ("above 55") even though it wins in more cases. It should cost more, so it is the cheap one. This is a plain purchase of one contract, not a spread. The value gap is usually small at prices near 97&cent; and larger in the middle of a ladder.</p>
 <p><b>Likely mispriced</b>: a range between two thresholds priced far below what the ranges on either side imply, assuming a single-peaked outcome. A bet that can lose a little, not a guarantee.</p>
 <p><b>Sportsbook gap</b>: Kalshi is on the wrong side of the sportsbook consensus (vig removed) by a wide margin. Totals, spreads and player props only. Books refund a player who doesn't play while Kalshi may not, so check that risk. Compare the sportsbook line on the card with the Kalshi rules before trading.</p>
+<p><b>Riskless</b> also covers <b>sets</b>: when at most N outcomes can pay (a winner list, a "top 10" list), their YES prices cannot add up to more than N x 100&cent;, and the same player cannot be priced higher for "top 1" than for "top 10". The <b>Sets</b> tab shows every such group with its total next to its limit.</p>
+<p><b>Spikes</b> are a separate idea: a price that jumped far above (or crashed far below) its recent level. The page suggests the opposite side (fade it) and shows the worst case. These are speculation, not mispricings. The track record panel measures whether fading has actually worked.</p>
 <p><b>Cheap offer</b>: the lowest offer is far below the next one in the book. It might be a mistake or might disappear before you act.</p>
 <p><b>Edge</b> is cents per contract after estimated fees. <b>Size</b> is contracts available at those exact prices. <b>Est. profit</b> = edge x size. <b>Best</b> sorting weights est. profit by how certain each type is. Prices can move before you trade, and only the top of the book is checked.</p>
 </details>
 <details id="bk" style="display:none"></details>
+<details id="cov" style="display:none"></details>
+<details id="track" style="display:none"></details>
 <div class="chips" id="tabs"></div>
 <input class="search" id="q" type="search" placeholder="Search (e.g. Rotten Tomatoes, CPI, Brunson)">
 <div class="lbl">Topic</div><div class="chips" id="cats"></div>
@@ -942,9 +1342,9 @@ details p{margin:8px 0 0;color:var(--muted)}
 <div id="feed"></div>
 </div>
 <script>
-const TN={arb:"Riskless",sum:"Riskless",shape:"Likely mispriced",book:"Sportsbook gap",cheap:"Cheap offer"};
-const GRP={arb:"safe",sum:"safe",shape:"shape",book:"book",cheap:"cheap"};
-const TYPES=[["safe","Riskless"],["shape","Likely mispriced"],["book","Sportsbook gap"],["cheap","Cheap offer"]];
+const TN={arb:"Riskless",sum:"Riskless",tier:"Riskless",flat:"Same price, more coverage",shape:"Likely mispriced",book:"Sportsbook gap",cheap:"Cheap offer"};
+const GRP={arb:"safe",sum:"safe",tier:"safe",flat:"flat",shape:"shape",book:"book",cheap:"cheap"};
+const TYPES=[["safe","Riskless"],["flat","Same price, more coverage"],["shape","Likely mispriced"],["book","Sportsbook gap"],["cheap","Cheap offer"]];
 const SORTS=[["score","Best"],["profit","Est. profit"],["edge","Edge"],["new","Newest"]];
 let S={tab:"opps",cat:"ALL",type:"ALL",sort:"score",q:""},data=null;
 try{const x=JSON.parse(localStorage.getItem("kalshi-board2")||"{}");S.cat=x.cat||"ALL";S.type=x.type||"ALL";S.sort=x.sort||"score";S.tab=x.tab||"opps"}catch(e){}
@@ -977,6 +1377,50 @@ function wcard(w){
   '</span><span class="age">opened '+ago(w.opened)+' ago</span></div><div class="title">'+esc(w.title)+'</div>'+
   (w.sub?'<div class="osub">'+esc(w.sub)+'</div>':"")+'<div class="head">'+px+'</div><div class="meta"><span class="tk">'+esc(w.ticker)+'</span>'+
   (url?'<a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a>':"")+'</div></div>'}
+function lcard(x){
+ const url=okurl(x.url);
+ let rows="";
+ x.tiers.forEach((t,i)=>{
+  rows+='<div class="leg"><b>'+esc(t.label)+'</b><span class="q">bid '+t.bid+'&cent; / ask '+t.ask+'&cent;</span></div>';
+  const st=x.steps[i];
+  if(st){const f=st.flat;
+   rows+='<div class="leg" style="'+(f?'background:var(--bg);color:var(--amber)':'color:var(--muted)')+';font-size:12.5px"><span>'+(f?'<b>Priced the same:</b> ':'')+
+    esc(st.lo)+' to '+esc(st.hi)+' is about '+st.prob+'%. Betting on that range costs '+st.breakeven+'&cent;, so it pays only if the true chance is above '+st.breakeven+'%.</span></div>'}
+ });
+ return '<div class="card"><div class="top"><span class="kind">Ladder</span><span class="cat">'+esc(x.cat)+'</span><span class="age">'+x.flat+' flat step'+(x.flat===1?"":"s")+'</span></div>'+
+  '<div class="title">'+esc(x.title)+'</div><div class="trade" style="margin-top:8px">'+rows+'</div>'+
+  (url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
+function spcard(x){
+ const url=okurl(x.url),up=x.dir==="up";
+ const l=x.legs[0];
+ const tags=(x.thin?'<span class="cat">Thin volume</span>':'<span class="cat">Heavy volume</span>')+
+  (x.iso?'<span class="cat">No related market moved</span>':'<span class="cat">'+x.related+' related market'+(x.related===1?"":"s")+' moved</span>');
+ return '<div class="card spike"><div class="top"><span class="kind" style="color:var(--red)">Spike '+(up?"up":"down")+'</span><span class="cat">'+esc(x.cat)+
+  '</span>'+tags+'<span class="age">started ~'+x.hours+' h ago</span></div><div class="title">'+esc(x.title)+'</div>'+(x.sub?'<div class="osub">'+esc(x.sub)+'</div>':"")+
+  '<div class="head">YES moved from '+x.base+'&cent; to '+x.now+'&cent; ('+(x.move>0?"+":"")+x.move+'&cent;) on about '+x.vol_move+' contracts.</div>'+
+  '<div class="nums"><div class="num"><b>+'+x.gain.toFixed(1)+'&cent;</b><span>gain if it retraces halfway (to '+x.target+'&cent;)</span></div>'+
+  '<div class="num"><b>'+x.risk+'&cent;</b><span>worst case loss per contract</span></div>'+
+  '<div class="num"><b>'+x.breakeven+'%</b><span>retrace rate needed if the worst case is total loss</span></div></div>'+
+  '<div class="trade"><div class="leg"><b>'+esc(l.action)+'</b><span>'+esc(l.label)+'</span><span class="px">'+l.price+'&cent;</span><span class="q">'+l.qty+' avail</span></div></div>'+
+  '<div class="why">Fade idea, not a guaranteed edge. Spikes on thin volume with nothing else moving are more likely noise or a single eager buyer. Spikes on heavy volume, or where related markets moved, are more likely real news, and fading real news loses.</div>'+
+  (url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
+function track(){
+ const el=document.getElementById("track"),t=data.spike_stats;
+ if(S.tab!=="spikes"||!t){el.style.display="none";return}
+ el.style.display="";
+ const row=(name,g)=>{if(!g||!g.count)return "";const f=(h,k)=>g[h]?g[h][k]:null;
+  const cell=h=>g[h]?("median retrace "+g[h].median+"%, half or more: "+g[h].half+"%, kept going: "+g[h].worse+"% (n="+g[h].n+")"):"not enough yet";
+  return "<p><b>"+name+"</b> ("+g.count+" logged)<br>After 1 h: "+cell("h1")+"<br>After 6 h: "+cell("h6")+"<br>After 24 h: "+cell("h24")+"</p>"};
+ el.innerHTML="<summary>Track record: did these spikes actually fade?</summary><p>Every spike the scanner sees is logged, and its price is checked again 1, 6 and 24 hours later. Retrace 100% means back to the pre-spike level; below 0% means it kept going.</p>"+
+  row("Thin volume, nothing else moved",t.thin_iso)+row("All other spikes",t.other)+(t.all.count?"":"<p>Nothing logged yet. Outcomes fill in as time passes.</p>")}
+function scard(x){
+ const url=okurl(x.url);
+ return '<div class="card set"><div class="top"><span class="kind" style="color:var(--muted)">Set</span><span class="cat">'+esc(x.cat)+
+  '</span><span class="age">'+x.n+' listed</span></div><div class="title">'+esc(x.title)+'</div>'+
+  '<div class="head">At most '+x.N+' of these can pay out, so prices should not add up to more than '+x.limit+'&cent;.</div>'+
+  '<div class="nums"><div class="num"><b>'+x.sum_bid+'&cent;</b><span>YES bids add up to</span></div><div class="num"><b>'+x.sum_ask+
+  '&cent;</b><span>YES asks add up to</span></div><div class="num"><b>'+x.limit+'&cent;</b><span>limit</span></div></div>'+
+  '<div class="why">'+esc(x.note)+'</div>'+(url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
 function books(){
  const el=document.getElementById("bk"),b=data.scan.books;
  if(!b){el.style.display="none";return}
@@ -991,6 +1435,16 @@ function books(){
   if(b.odds_sample&&b.odds_sample.length)h+="<p>Sportsbook games loaded, e.g.:<br>"+b.odds_sample.map(esc).join("<br>")+"</p>";
  }
  el.innerHTML=h}
+function coverage(){
+ const el=document.getElementById("cov"),c=data.scan.cats;
+ if(!c||!Object.keys(c).length){el.style.display="none";return}
+ el.style.display="";
+ el.innerHTML="<summary>Coverage by topic</summary>"+Object.keys(c).sort((x,y)=>c[y].markets-c[x].markets).map(k=>
+  "<p><b>"+esc(k)+"</b>: "+c[k].markets.toLocaleString()+" markets, "+c[k].ladders+" price ladders, "+(c[k].flagged||0)+" flagged</p>").join("")}
+function emptyMsg(){
+ const c=(data.scan.cats||{})[S.cat];
+ if(S.cat!=="ALL"&&c)return "Scanned "+c.markets.toLocaleString()+" "+esc(S.cat)+" markets and "+c.ladders+" price ladders in this topic. Nothing flagged right now.";
+ return "Nothing matches right now. Real inconsistencies are rare and short-lived."}
 function render(){
  if(!data)return;
  const sc=data.scan,age=Date.now()/1000-data.updated,watch=data.watch||[];
@@ -999,22 +1453,28 @@ function render(){
  if(sc.error)sub+='<br><span class="bad">Last scan failed: '+esc(sc.error)+'</span>';
  else if(!sc.ladders)sub+='<br><span class="warn">No ladders were detected. The strike data may have a different format than expected.</span>';
  document.getElementById("sub").innerHTML=sub;
- books();
+ books();coverage();track();
  const tb=document.getElementById("tabs");tb.innerHTML="";
  tb.appendChild(chip("Opportunities",data.items.length,S.tab==="opps",()=>{S.tab="opps";save();render()}));
+ tb.appendChild(chip("Ladders",(data.ladders||[]).length,S.tab==="ladders",()=>{S.tab="ladders";save();render()}));
+ tb.appendChild(chip("Spikes",(data.spikes||[]).length,S.tab==="spikes",()=>{S.tab="spikes";save();render()}));
+ tb.appendChild(chip("Sets",(data.sets||[]).length,S.tab==="sets",()=>{S.tab="sets";save();render()}));
  tb.appendChild(chip("New markets",watch.length,S.tab==="new",()=>{S.tab="new";save();render()}));
  const opps=S.tab==="opps";
  document.getElementById("typewrap").style.display=opps?"":"none";
  document.getElementById("sortwrap").style.display=opps?"":"none";
  const q=S.q.trim().toLowerCase();
- const pool=opps?data.items:watch;
- const text=i=>opps?(i.title+" "+i.headline+" "+i.cat+" "+i.legs.map(l=>l.label+" "+l.ticker).join(" ")):(i.title+" "+i.sub+" "+i.cat+" "+i.ticker);
+ const pool=opps?data.items:S.tab==="sets"?(data.sets||[]):S.tab==="spikes"?(data.spikes||[]):S.tab==="ladders"?(data.ladders||[]):watch;
+ const text=i=>opps?(i.title+" "+i.headline+" "+i.cat+" "+i.legs.map(l=>l.label+" "+l.ticker).join(" ")):S.tab==="sets"||S.tab==="ladders"?(i.title+" "+i.cat):(i.title+" "+(i.sub||"")+" "+i.cat+" "+i.ticker);
  const base=pool.filter(i=>!q||text(i).toLowerCase().includes(q));
  const byType=opps?base.filter(i=>S.type==="ALL"||GRP[i.kind]===S.type):base;
+ const cov=sc.cats||{};
  const cats={};byType.forEach(i=>cats[i.cat]=(cats[i.cat]||0)+1);
+ Object.keys(cov).forEach(c=>{if(!(c in cats))cats[c]=0});
  const ce=document.getElementById("cats");ce.innerHTML="";
  ce.appendChild(chip("All",byType.length,S.cat==="ALL",()=>{S.cat="ALL";save();render()}));
- Object.keys(cats).sort((x,y)=>cats[y]-cats[x]).forEach(c=>ce.appendChild(chip(c,cats[c],S.cat===c,()=>{S.cat=c;save();render()})));
+ Object.keys(cats).sort((x,y)=>(cats[y]-cats[x])||(((cov[y]||{}).markets||0)-((cov[x]||{}).markets||0))).forEach(c=>{
+  const b=chip(c,cats[c],S.cat===c,()=>{S.cat=c;save();render()});if(!cats[c])b.style.opacity=".55";ce.appendChild(b)});
  const byCat=base.filter(i=>S.cat==="ALL"||i.cat===S.cat);
  if(opps){
   const te=document.getElementById("types");te.innerHTML="";
@@ -1025,9 +1485,9 @@ function render(){
  }
  const list=byCat.filter(i=>!opps||S.type==="ALL"||GRP[i.kind]===S.type);
  if(opps)list.sort((x,y)=>S.sort==="edge"?y.edge-x.edge:S.sort==="profit"?y.profit-x.profit:S.sort==="new"?y.first_seen-x.first_seen:y.score-x.score);
- document.getElementById("count").textContent=opps?list.length+" opportunit"+(list.length===1?"y":"ies"):list.length+" newly opened, unpriced or wide-spread markets (newest first)";
- document.getElementById("feed").innerHTML=list.length?list.map(opps?card:wcard).join(""):
-  '<div class="empty">Nothing matches right now. Real inconsistencies are rare and short-lived.</div>';
+ document.getElementById("count").textContent=opps?list.length+" opportunit"+(list.length===1?"y":"ies"):S.tab==="sets"?list.length+" sets where only some outcomes can pay (largest deviation from the limit first)":S.tab==="spikes"?list.length+" recent price spikes (thin, unconfirmed moves first)":S.tab==="ladders"?list.length+" ladders with tiers priced the same (widest flat stretches first). Each step shows the chance you would need to believe for a bet on that range to pay.":list.length+" newly opened, unpriced or wide-spread markets (newest first)";
+ document.getElementById("feed").innerHTML=list.length?list.map(opps?card:S.tab==="sets"?scard:S.tab==="spikes"?spcard:S.tab==="ladders"?lcard:wcard).join(""):
+  '<div class="empty">'+emptyMsg()+'</div>';
 }
 document.getElementById("q").addEventListener("input",e=>{S.q=e.target.value;render()});
 async function load(){try{const r=await fetch("board.json?"+Date.now());data=await r.json();render()}
