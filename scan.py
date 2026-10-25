@@ -232,7 +232,7 @@ def analyze(L, a):
         for j in range(i, nb):  # a span covers bands i..j, i.e. legs[i] to legs[j+1]
             lo, hi = legs[i], legs[j + 1]
             lb = 0.0
-            if i > 0 and j < nb - 1:  # unimodal floor: density >= min(best on left, best on right)
+            if False and i > 0 and j < nb - 1:  # single-peak "shape" check removed: it needs a buy-one-sell-another bet
                 left = max(b["dlow"] for b in bands[:i])
                 right = max(b["dlow"] for b in bands[j + 1:])
                 lb = min(left, right) * (hi["k"] - lo["k"])
@@ -265,9 +265,10 @@ def flat_candidates(L, a):
         lo, hi = legs[i], legs[i + 1]
         if lo["ask"] > hi["ask"]:
             continue
-        q = 0.0   # extra coverage: single-peak estimate from the ranges either side (mid prices)
+        q = 0.0   # extra coverage: what the two neighbouring ranges suggest (mid prices), capped by their mass
         if 0 < i < len(dens) - 1:
-            q = min(max(dens[:i]), max(dens[i + 1:])) * (hi["k"] - lo["k"])
+            q = min(dens[i - 1], dens[i + 1]) * (hi["k"] - lo["k"])
+            q = min(q, dens[i - 1] * (lo["k"] - legs[i - 1]["k"]), dens[i + 1] * (legs[i + 2]["k"] - hi["k"]))
         far = max([mids[j] for j in range(i + 2, len(legs))] or [0])
         fair = max(mids[i + 1] + q, far)
         edge = fair - lo["ask"] - fee_c(lo["ask"])
@@ -977,13 +978,31 @@ def spike_stats(log):
     return {g: {"count": len(rows), **{f"h{h}": agg(rows, h) for h in (1, 6, 24)}} for g, rows in groups.items()}
 
 
+LEAGUE_TICK = re.compile(r"(?:^|[^A-Z])(?:KX)?(?:NBA|NFL)")
+LEAGUE_TEXT = re.compile(r"\b(?:nfl|nba|pro football|pro basketball|fantasy football|super bowl|nba finals)\b")
+OTHER_TEXT = re.compile(r"\b(?:wnba|ncaa|ncaaf|ncaab|college)\b")
+
+
+def league_ok(e):
+    """True for NFL and NBA events (including fantasy football). Everything else in Sports is ignored."""
+    ms = e.get("markets") or [{}]
+    tick = f"{e.get('series_ticker') or ''} {e.get('event_ticker') or ''}".upper()
+    text = norm(f"{e.get('title') or ''} {ms[0].get('title') or ''} {ms[0].get('rules_primary') or ''}")
+    if OTHER_TEXT.search(text) or "WNBA" in tick or "NCAA" in tick:
+        return False
+    return bool(LEAGUE_TICK.search(tick) or LEAGUE_TEXT.search(text))
+
+
 # ---------- scan ----------
 def scan(a, state, now, ctx):
     events = fetch_events()
     cats = category_map(events)
-    markets, evs = [], []
+    markets, evs, excluded = [], [], 0
     for e in events:
         cat = e.get("category") or cats.get(e.get("series_ticker")) or "Other"
+        if a.sports != "all" and "sport" in cat.lower() and not league_ok(e):
+            excluded += len(e.get("markets", []))
+            continue
         ms = []
         for m in e.get("markets", []):
             m["_cat"], m["_event"] = cat, e.get("event_ticker") or ""
@@ -1128,7 +1147,7 @@ def scan(a, state, now, ctx):
     for L in ladders:
         cat_stats.setdefault(L["cat"], {"markets": 0, "ladders": 0, "flagged": 0})["ladders"] += 1
     return items, watch, {"events": len(events), "markets": len(markets), "ladders": len(ladders),
-                          "checked": len(cands), "books": books_info, "cats": cat_stats}
+                          "checked": len(cands), "books": books_info, "cats": cat_stats, "sports_excluded": excluded}
 
 
 # ---------- push ----------
@@ -1157,6 +1176,8 @@ def main():
     ap.add_argument("--push-min-profit", type=float, default=3.0, help="min score ($) to send a push")
     ap.add_argument("--keep", type=int, default=200)
     ap.add_argument("--max-edge", type=float, default=60, help="drop anything with a bigger edge (cents): almost surely a data/matching error")
+    ap.add_argument("--sports", default="nfl_nba", help="nfl_nba (default) or all")
+    ap.add_argument("--max-edge-spec", type=float, default=25, help="drop shape/same-price/sportsbook items claiming more than this (cents)")
     ap.add_argument("--flat-min-edge", type=float, default=0.2, help="min value gap (cents) to flag a same-price tier")
     ap.add_argument("--flat-min-profit", type=float, default=0.25, help="min est. profit ($) for a same-price tier")
     ap.add_argument("--flat-books", type=int, default=40, help="same-price tiers to verify per run")
@@ -1209,7 +1230,10 @@ def main():
     info["duration"] = round(time.time() - t0, 1)
     info["spike_err"] = ctx.get("spike_err")
 
-    cap = lambda it: a.max_edge * (it.get("N", 1) if it["kind"] == "sum" else 1)  # sets pay per full set
+    def cap(it):  # sets pay per full set; judgment-based types get a tighter cap
+        if it["kind"] == "sum":
+            return a.max_edge * it.get("N", 1)
+        return a.max_edge_spec if it["kind"] in ("shape", "flat", "book") else a.max_edge
     dropped = [it for it in items if it["edge"] > cap(it)]
     if dropped:
         print(f"dropped {len(dropped)} implausible items (edge too large):", [d["title"] for d in dropped][:5])
@@ -1323,7 +1347,6 @@ details p{margin:8px 0 0;color:var(--muted)}
 <details><summary>How to read this</summary>
 <p><b>Riskless</b>: trades that pay at least what they cost in every outcome, after fees (a higher threshold priced above a lower one, or exclusive outcomes whose YES bids add up past 100).</p>
 <p><b>Same price, more coverage</b>: a lower threshold (say "above 50") costs the same as a higher one ("above 55") even though it wins in more cases. It should cost more, so it is the cheap one. This is a plain purchase of one contract, not a spread. The value gap is usually small at prices near 97&cent; and larger in the middle of a ladder.</p>
-<p><b>Likely mispriced</b>: a range between two thresholds priced far below what the ranges on either side imply, assuming a single-peaked outcome. A bet that can lose a little, not a guarantee.</p>
 <p><b>Sportsbook gap</b>: Kalshi is on the wrong side of the sportsbook consensus (vig removed) by a wide margin. Totals, spreads and player props only. Books refund a player who doesn't play while Kalshi may not, so check that risk. Compare the sportsbook line on the card with the Kalshi rules before trading.</p>
 <p><b>Riskless</b> also covers <b>sets</b>: when at most N outcomes can pay (a winner list, a "top 10" list), their YES prices cannot add up to more than N x 100&cent;, and the same player cannot be priced higher for "top 1" than for "top 10". The <b>Sets</b> tab shows every such group with its total next to its limit.</p>
 <p><b>Spikes</b> are a separate idea: a price that jumped far above (or crashed far below) its recent level. The page suggests the opposite side (fade it) and shows the worst case. These are speculation, not mispricings. The track record panel measures whether fading has actually worked.</p>
@@ -1344,7 +1367,7 @@ details p{margin:8px 0 0;color:var(--muted)}
 <script>
 const TN={arb:"Riskless",sum:"Riskless",tier:"Riskless",flat:"Same price, more coverage",shape:"Likely mispriced",book:"Sportsbook gap",cheap:"Cheap offer"};
 const GRP={arb:"safe",sum:"safe",tier:"safe",flat:"flat",shape:"shape",book:"book",cheap:"cheap"};
-const TYPES=[["safe","Riskless"],["flat","Same price, more coverage"],["shape","Likely mispriced"],["book","Sportsbook gap"],["cheap","Cheap offer"]];
+const TYPES=[["safe","Riskless"],["flat","Same price, more coverage"],["book","Sportsbook gap"],["cheap","Cheap offer"]];
 const SORTS=[["score","Best"],["profit","Est. profit"],["edge","Edge"],["new","Newest"]];
 let S={tab:"opps",cat:"ALL",type:"ALL",sort:"score",q:""},data=null;
 try{const x=JSON.parse(localStorage.getItem("kalshi-board2")||"{}");S.cat=x.cat||"ALL";S.type=x.type||"ALL";S.sort=x.sort||"score";S.tab=x.tab||"opps"}catch(e){}
@@ -1385,7 +1408,7 @@ function lcard(x){
   const st=x.steps[i];
   if(st){const f=st.flat;
    rows+='<div class="leg" style="'+(f?'background:var(--bg);color:var(--amber)':'color:var(--muted)')+';font-size:12.5px"><span>'+(f?'<b>Priced the same:</b> ':'')+
-    esc(st.lo)+' to '+esc(st.hi)+' is about '+st.prob+'%. Betting on that range costs '+st.breakeven+'&cent;, so it pays only if the true chance is above '+st.breakeven+'%.</span></div>'}
+    esc(st.lo)+' to '+esc(st.hi)+' is priced at about '+st.prob+'%.'+(f?' The lower tier wins in more cases, so it is the better buy at the same price.':'')+'</span></div>'}
  });
  return '<div class="card"><div class="top"><span class="kind">Ladder</span><span class="cat">'+esc(x.cat)+'</span><span class="age">'+x.flat+' flat step'+(x.flat===1?"":"s")+'</span></div>'+
   '<div class="title">'+esc(x.title)+'</div><div class="trade" style="margin-top:8px">'+rows+'</div>'+
@@ -1440,7 +1463,8 @@ function coverage(){
  if(!c||!Object.keys(c).length){el.style.display="none";return}
  el.style.display="";
  el.innerHTML="<summary>Coverage by topic</summary>"+Object.keys(c).sort((x,y)=>c[y].markets-c[x].markets).map(k=>
-  "<p><b>"+esc(k)+"</b>: "+c[k].markets.toLocaleString()+" markets, "+c[k].ladders+" price ladders, "+(c[k].flagged||0)+" flagged</p>").join("")}
+  "<p><b>"+esc(k)+"</b>: "+c[k].markets.toLocaleString()+" markets, "+c[k].ladders+" price ladders, "+(c[k].flagged||0)+" flagged</p>").join("")+
+  (data.scan.sports_excluded?"<p>Sports are limited to NFL and NBA. "+data.scan.sports_excluded.toLocaleString()+" markets in other sports are ignored.</p>":"")}
 function emptyMsg(){
  const c=(data.scan.cats||{})[S.cat];
  if(S.cat!=="ALL"&&c)return "Scanned "+c.markets.toLocaleString()+" "+esc(S.cat)+" markets and "+c.ladders+" price ladders in this topic. Nothing flagged right now.";
@@ -1485,7 +1509,7 @@ function render(){
  }
  const list=byCat.filter(i=>!opps||S.type==="ALL"||GRP[i.kind]===S.type);
  if(opps)list.sort((x,y)=>S.sort==="edge"?y.edge-x.edge:S.sort==="profit"?y.profit-x.profit:S.sort==="new"?y.first_seen-x.first_seen:y.score-x.score);
- document.getElementById("count").textContent=opps?list.length+" opportunit"+(list.length===1?"y":"ies"):S.tab==="sets"?list.length+" sets where only some outcomes can pay (largest deviation from the limit first)":S.tab==="spikes"?list.length+" recent price spikes (thin, unconfirmed moves first)":S.tab==="ladders"?list.length+" ladders with tiers priced the same (widest flat stretches first). Each step shows the chance you would need to believe for a bet on that range to pay.":list.length+" newly opened, unpriced or wide-spread markets (newest first)";
+ document.getElementById("count").textContent=opps?list.length+" opportunit"+(list.length===1?"y":"ies"):S.tab==="sets"?list.length+" sets where only some outcomes can pay (largest deviation from the limit first)":S.tab==="spikes"?list.length+" recent price spikes (thin, unconfirmed moves first)":S.tab==="ladders"?list.length+" ladders with tiers priced the same (widest flat stretches first). Each step shows how much chance the market gives to that range.":list.length+" newly opened, unpriced or wide-spread markets (newest first)";
  document.getElementById("feed").innerHTML=list.length?list.map(opps?card:S.tab==="sets"?scard:S.tab==="spikes"?spcard:S.tab==="ladders"?lcard:wcard).join(""):
   '<div class="empty">'+emptyMsg()+'</div>';
 }
