@@ -98,9 +98,46 @@ def gap_flag(levels, min_gap, max_size):
 
 
 # ---------- scan ----------
+KIND_NAME = {"GAP": "Odd order", "JUMP": "Price jump", "NEW": "New market"}
+
+
+def category_map(events):
+    """series_ticker -> category, used only if events don't carry a category themselves."""
+    cats = {}
+    if any(not e.get("category") for e in events):
+        try:
+            for s in get("/series").get("series", []):
+                cats[s.get("ticker")] = s.get("category")
+        except Exception as ex:
+            print("series lookup failed:", ex)
+    return cats
+
+
+def describe(e, m):
+    title = (e.get("title") or m.get("title") or m.get("ticker") or "").strip()
+    sub = (m.get("yes_sub_title") or "").strip()
+    if not sub or sub.lower() == title.lower():
+        sub = ""
+    return title[:110], sub[:70]
+
+
+def ago_text(dt):
+    mins = max(0, (datetime.now(timezone.utc) - dt).total_seconds() / 60)
+    return f"{mins:.0f} min ago" if mins < 90 else f"{mins/60:.1f} hours ago"
+
+
 def scan(a, prev, emit):
     events = fetch_events()
-    markets = [m for e in events for m in e.get("markets", [])]
+    cats = category_map(events)
+    markets = []
+    for e in events:
+        cat = e.get("category") or cats.get(e.get("series_ticker")) or "Other"
+        for m in e.get("markets", []):
+            m["_cat"] = cat
+            m["_series"] = e.get("series_ticker") or ""
+            m["_title"], m["_sub"] = describe(e, m)
+            markets.append(m)
+
     new_prev, fresh = {}, []
     new_cut = datetime.now(timezone.utc) - timedelta(hours=a.new_hours)
     new_emitted = 0
@@ -111,13 +148,15 @@ def scan(a, prev, emit):
         yb = yb if yb and yb > 0 else None
         ya = ya if ya and ya < 100 else None
         vol = num(m, "volume_24h")
-        lab = label(m)
+        extra = f"24h volume {vol:,.0f}" if vol else ""
 
         p = prev.get(t)
         if p and vol >= a.jump_min_vol:
             for name, old, new in (("bid", p[0], yb), ("ask", p[1], ya)):
                 if old is not None and new is not None and abs(new - old) >= a.jump:
-                    emit("JUMP", t, f"yes {name} {old} -> {new} | 24h vol {vol:.0f} | {lab}", f"{name}{new}")
+                    what = "buyers are bidding" if name == "bid" else "sellers are asking"
+                    emit("JUMP", m, f"YES {what} {new}\u00a2, was {old}\u00a2 at the last scan ({new-old:+d}\u00a2)",
+                         f"{name}{new}", extra)
         new_prev[t] = [yb, ya]
 
         ot = m.get("open_time") or m.get("created_time")
@@ -130,7 +169,12 @@ def scan(a, prev, emit):
                 fresh.append(m)
                 spread = (ya - yb) if (ya and yb) else None
                 if (spread is None or spread >= a.wide_spread) and new_emitted < a.new_per_run:
-                    if emit("NEW", t, f"opened {ot[:16]}Z | bid {yb} ask {ya} | {lab}", "new"):
+                    if spread is None:
+                        q = "no buyers or sellers yet" if not (yb or ya) else \
+                            f"only one side quoted (bid {yb}\u00a2 / ask {ya}\u00a2)".replace("None\u00a2", "none")
+                    else:
+                        q = f"wide spread: bid {yb}\u00a2 vs ask {ya}\u00a2 ({spread}\u00a2 apart)"
+                    if emit("NEW", m, f"Opened {ago_text(opened)}; {q}", "new", extra):
                         new_emitted += 1
 
     active = sorted(markets, key=lambda m: num(m, "volume_24h"), reverse=True)[:a.top]
@@ -145,13 +189,16 @@ def scan(a, prev, emit):
         except Exception as ex:
             print(f"skip {t}: {ex}")
             continue
-        lab = label(m)
+        vol = num(m, "volume_24h")
+        extra = f"24h volume {vol:,.0f}" if vol else ""
         g = gap_flag(yes, a.gap, a.max_size)
         if g:
-            emit("GAP", t, f"YES bid {g[0]} x{g[1]} isolated, next level {g[2]} ({g[0]-g[2]}c gap) | {lab}", f"y{g[0]}")
+            emit("GAP", m, f"One buyer bids {g[0]}\u00a2 for YES ({g[1]} contracts), but the next bid is only "
+                           f"{g[2]}\u00a2, {g[0]-g[2]}\u00a2 lower", f"y{g[0]}", extra)
         g = gap_flag(no, a.gap, a.max_size)
         if g:
-            emit("GAP", t, f"YES ask {100-g[0]} x{g[1]} isolated, next level {100-g[2]} ({g[0]-g[2]}c gap) | {lab}", f"n{g[0]}")
+            emit("GAP", m, f"One seller offers YES at {100-g[0]}\u00a2 ({g[1]} contracts), but the next offer is "
+                           f"{100-g[2]}\u00a2, {g[0]-g[2]}\u00a2 higher", f"n{g[0]}", extra)
         time.sleep(0.08)
 
     return len(events), len(markets), new_prev
@@ -196,13 +243,16 @@ def main():
     seen = {k: v for k, v in state.get("seen", {}).items() if now - v < a.dedupe_hours * 3600}
     new_alerts = []
 
-    def emit(kind, ticker, msg, key=None):
-        sk = f"{kind}|{ticker}|{key or msg}"
+    def emit(kind, m, headline, key=None, extra=""):
+        sk = f"{kind}|{m['ticker']}|{key or headline}"
         if sk in seen:
             return False
         seen[sk] = now
-        new_alerts.append({"t": now, "kind": kind, "ticker": ticker, "msg": msg})
-        print(f"{kind:<5} {ticker}  {msg}")
+        series = m.get("_series") or ""
+        new_alerts.append({"t": now, "kind": kind, "ticker": m["ticker"], "cat": m["_cat"],
+                           "title": m["_title"], "sub": m["_sub"], "headline": headline, "extra": extra,
+                           "url": f"https://kalshi.com/markets/{series.lower()}" if series else ""})
+        print(f"{kind:<5} [{m['_cat']}] {m['_title']} | {headline}")
         return True
 
     info = {"events": 0, "markets": 0, "duration": None, "error": None}
@@ -216,18 +266,22 @@ def main():
     info["duration"] = round(time.time() - t0, 1)
 
     new_alerts.sort(key=lambda x: PRIORITY.get(x["kind"], 9))
-    history = (new_alerts + state.get("history", []))[:a.history]
+    old = [h for h in state.get("history", []) if "headline" in h]
+    history = (new_alerts + old)[:a.history]
 
     page_url = os.environ.get("PAGES_URL")
     if new_alerts:
         counts = {}
         for x in new_alerts:
             counts[x["kind"]] = counts.get(x["kind"], 0) + 1
-        title = f"Kalshi: {len(new_alerts)} new (" + ", ".join(f"{v} {k}" for k, v in counts.items()) + ")"
-        lines = [f"{x['kind']} {x['ticker']}: {x['msg']}"[:160] for x in new_alerts[:6]]
-        if len(new_alerts) > 6:
-            lines.append(f"+{len(new_alerts) - 6} more on the page")
-        push(title, "\n".join(lines), page_url)
+        title = f"Kalshi: {len(new_alerts)} new (" + ", ".join(f"{v} {KIND_NAME[k].lower()}" for k, v in counts.items()) + ")"
+        lines = []
+        for x in new_alerts[:5]:
+            name = x["title"][:60] + (f" - {x['sub'][:30]}" if x["sub"] else "")
+            lines.append(f"{KIND_NAME[x['kind']]} | {x['cat']} | {name}\n{x['headline']}")
+        if len(new_alerts) > 5:
+            lines.append(f"+{len(new_alerts) - 5} more on the page")
+        push(title, "\n\n".join(lines), page_url)
 
     err_pushed = state.get("err_pushed", False)
     if info["error"] and not err_pushed:
@@ -251,67 +305,88 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kalshi Alerts</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--text:#14181f;--muted:#6b7280;--line:#e5e7eb;
---blue:#2563eb;--purple:#7c3aed;--teal:#0e9aa7;--red:#dc2626;--amber:#d98a00}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#171b21;--text:#e8eaed;--muted:#8b93a1;--line:#262c35;
---blue:#5b8def;--purple:#a78bfa;--teal:#2dd4d4;--red:#f87171;--amber:#f0b429}}
+:root{--bg:#f4f5f7;--card:#fff;--text:#14181f;--muted:#667085;--line:#e4e7ec;
+--gap:#2563eb;--jump:#7c3aed;--new:#0e9aa7;--red:#dc2626;--amber:#b7791f;--accent:#14181f}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1115;--card:#171b21;--text:#eceef1;--muted:#8d95a3;--line:#262c35;
+--gap:#6b9bff;--jump:#a78bfa;--new:#2dd4d4;--red:#f87171;--amber:#f0b429;--accent:#eceef1}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-.wrap{max-width:900px;margin:0 auto;padding:14px}
-h1{font-size:18px;margin:0 0 2px}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:14px}
+h1{font-size:19px;margin:2px 0 2px}
 .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
 .warn{color:var(--amber)}.bad{color:var(--red)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:9px 11px}
-.stat b{display:block;font-size:19px}.stat span{color:var(--muted);font-size:12px}
-.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
-.chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:5px 11px;font-size:13px}
-.chip.on{background:var(--text);color:var(--bg);border-color:var(--text)}
-.feed{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-.row{padding:10px 12px;border-bottom:1px solid var(--line)}
-.row:last-child{border:0}
-.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.badge{font-size:11px;font-weight:700;border-radius:6px;padding:2px 7px;color:#fff}
-.GAP{background:var(--blue)}.JUMP{background:var(--purple)}.NEW{background:var(--teal)}
-.tk{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
-.age{color:var(--muted);font-size:12px;margin-left:auto}
-.msg{color:var(--muted);margin-top:3px;word-break:break-word}
-.empty{padding:26px;text-align:center;color:var(--muted)}
+.search{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;margin-bottom:10px}
+.lbl{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:8px 0 5px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:6px 12px;font-size:13px;cursor:pointer}
+.chip.on{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.chip small{opacity:.65;margin-left:3px}
+.count{color:var(--muted);font-size:13px;margin:14px 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:10px;padding:11px 13px;margin-bottom:9px}
+.card.GAP{border-left-color:var(--gap)}.card.JUMP{border-left-color:var(--jump)}.card.NEW{border-left-color:var(--new)}
+.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:5px}
+.kind{font-weight:700}.GAP .kind{color:var(--gap)}.JUMP .kind{color:var(--jump)}.NEW .kind{color:var(--new)}
+.cat{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:1px 7px;color:var(--muted)}
+.age{margin-left:auto;color:var(--muted)}
+.title{font-weight:650;font-size:15.5px}
+.osub{color:var(--muted);font-size:14px}
+.head{margin-top:6px}
+.meta{margin-top:6px;color:var(--muted);font-size:12.5px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.meta a{color:var(--gap)}
+.tk{font-family:ui-monospace,Menlo,Consolas,monospace}
+.empty{padding:28px;text-align:center;color:var(--muted)}
 </style></head><body><div class="wrap">
 <h1>Kalshi alerts</h1>
-<div class="sub" id="sub">loading…</div>
-<div class="stats">
-<div class="stat"><b id="s1">–</b><span>markets scanned</span></div>
-<div class="stat"><b id="s2">–</b><span>alerts, last 24h</span></div>
-<div class="stat"><b id="s3">–</b><span>last scan (s)</span></div>
-</div>
-<div class="chips" id="chips"></div>
-<div class="feed" id="feed"><div class="empty">Loading…</div></div>
+<div class="sub" id="sub">loading...</div>
+<input class="search" id="q" type="search" placeholder="Search markets (e.g. Fed, NBA, Oscars)">
+<div class="lbl">Topic</div><div class="chips" id="cats"></div>
+<div class="lbl">Type</div><div class="chips" id="kinds"></div>
+<div class="count" id="count"></div>
+<div id="feed"></div>
 </div>
 <script>
-const KINDS=["ALL","GAP","JUMP","NEW"];let filter="ALL",data=null;
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const KN={GAP:"Odd order",JUMP:"Price jump",NEW:"New market"};
+const KDESC={GAP:"a lone order far from the rest of the book",JUMP:"price moved a lot since the last scan",NEW:"recently opened, not priced yet"};
+let S={cat:"ALL",kind:"ALL",q:""},data=null;
+try{Object.assign(S,JSON.parse(localStorage.getItem("kalshi-filters")||"{}"));S.q=""}catch(e){}
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const ago=t=>{const s=Math.max(0,Math.round(Date.now()/1000-t));
- return s<90?s+"s ago":s<5400?Math.round(s/60)+"m ago":s<172800?Math.round(s/3600)+"h ago":Math.round(s/86400)+"d ago"};
+ return s<90?s+"s ago":s<5400?Math.round(s/60)+" min ago":s<172800?Math.round(s/3600)+" h ago":Math.round(s/86400)+" d ago"};
+function save(){try{localStorage.setItem("kalshi-filters",JSON.stringify({cat:S.cat,kind:S.kind}))}catch(e){}}
+function chip(label,n,on,fn){const b=document.createElement("button");b.className="chip"+(on?" on":"");
+ b.innerHTML=esc(label)+"<small>"+n+"</small>";b.onclick=fn;return b}
 function render(){
- if(!data)return;const sc=data.scan,age=Date.now()/1000-data.updated;
- let sub="Updated "+ago(data.updated);
+ if(!data)return;
+ const sc=data.scan,age=Date.now()/1000-data.updated;
+ let sub="Updated "+ago(data.updated)+" \u00b7 "+(sc.markets||0).toLocaleString()+" markets scanned";
  if(age>1200)sub+=' <span class="warn">(stale: scans may be paused)</span>';
- if(sc.error)sub+=' <span class="bad">· last scan failed: '+esc(sc.error)+'</span>';
+ if(sc.error)sub+='<br><span class="bad">Last scan failed: '+esc(sc.error)+'</span>';
  document.getElementById("sub").innerHTML=sub;
- document.getElementById("s1").textContent=sc.markets||"–";
- document.getElementById("s2").textContent=data.alerts.filter(a=>Date.now()/1000-a.t<86400).length;
- document.getElementById("s3").textContent=sc.duration??"–";
- const c=document.getElementById("chips");c.innerHTML="";
- KINDS.forEach(k=>{const n=k==="ALL"?data.alerts.length:data.alerts.filter(a=>a.kind===k).length;
-  const b=document.createElement("button");b.className="chip"+(k===filter?" on":"");
-  b.textContent=k+" "+n;b.onclick=()=>{filter=k;render()};c.appendChild(b)});
- const list=data.alerts.filter(a=>filter==="ALL"||a.kind===filter);
- document.getElementById("feed").innerHTML=list.length?list.map(a=>
-  '<div class="row"><div class="top"><span class="badge '+a.kind+'">'+a.kind+'</span><span class="tk">'+esc(a.ticker)+
-  '</span><span class="age">'+ago(a.t)+'</span></div><div class="msg">'+esc(a.msg)+'</div></div>').join("")
-  :'<div class="empty">Nothing flagged yet. Real mispricings are rare.</div>';
+ const q=S.q.trim().toLowerCase();
+ const txt=a=>(a.title+" "+a.sub+" "+a.ticker+" "+a.cat).toLowerCase();
+ const base=data.alerts.filter(a=>!q||txt(a).includes(q));
+ const byKind=base.filter(a=>S.kind==="ALL"||a.kind===S.kind);
+ const cats={};byKind.forEach(a=>cats[a.cat]=(cats[a.cat]||0)+1);
+ const ce=document.getElementById("cats");ce.innerHTML="";
+ ce.appendChild(chip("All",byKind.length,S.cat==="ALL",()=>{S.cat="ALL";save();render()}));
+ Object.keys(cats).sort((x,y)=>cats[y]-cats[x]).forEach(c=>ce.appendChild(chip(c,cats[c],S.cat===c,()=>{S.cat=c;save();render()})));
+ const byCat=base.filter(a=>S.cat==="ALL"||a.cat===S.cat);
+ const ke=document.getElementById("kinds");ke.innerHTML="";
+ ke.appendChild(chip("All",byCat.length,S.kind==="ALL",()=>{S.kind="ALL";save();render()}));
+ ["GAP","JUMP","NEW"].forEach(k=>ke.appendChild(chip(KN[k],byCat.filter(a=>a.kind===k).length,S.kind===k,()=>{S.kind=k;save();render()})));
+ const list=base.filter(a=>(S.cat==="ALL"||a.cat===S.cat)&&(S.kind==="ALL"||a.kind===S.kind));
+ document.getElementById("count").textContent=S.kind!=="ALL"?KN[S.kind]+": "+KDESC[S.kind]:"Newest first";
+ document.getElementById("feed").innerHTML=list.length?list.map(a=>{
+  const url=(a.url||"").indexOf("https://kalshi.com/")===0?a.url:"";
+  return '<div class="card '+esc(a.kind)+'"><div class="top"><span class="kind">'+esc(KN[a.kind]||a.kind)+
+  '</span><span class="cat">'+esc(a.cat)+'</span><span class="age">'+ago(a.t)+'</span></div>'+
+  '<div class="title">'+esc(a.title)+'</div>'+(a.sub?'<div class="osub">'+esc(a.sub)+'</div>':"")+
+  '<div class="head">'+esc(a.headline)+'</div><div class="meta">'+(a.extra?'<span>'+esc(a.extra)+'</span>':"")+
+  '<span class="tk">'+esc(a.ticker)+'</span>'+(url?'<a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a>':"")+
+  '</div></div>'}).join("")
+  :'<div class="empty">Nothing matches these filters.</div>';
 }
+document.getElementById("q").addEventListener("input",e=>{S.q=e.target.value;render()});
 async function load(){try{const r=await fetch("alerts.json?"+Date.now());data=await r.json();render()}
  catch(e){document.getElementById("sub").textContent="Could not load alerts.json"}}
 load();setInterval(load,60000);
