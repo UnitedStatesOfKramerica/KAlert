@@ -135,6 +135,38 @@ def quotes(m):
     return (yb if yb and yb > 0 else None), (ya if ya and ya < 100 else None)
 
 
+def slug(x):
+    return re.sub(r"[^a-z0-9]+", "-", str(x).lower()).strip("-")[:60] or "market"
+
+
+def add_links(it):
+    """Per-leg links. A market ticker is 'EVENT-SUFFIX', and the series is the first part of the event ticker.
+    The series page alone can open a different event (fantasy markets share one series), so link the event too."""
+    for l in it["legs"]:
+        ev = l["ticker"].rsplit("-", 1)[0]
+        series = ev.split("-")[0].lower()
+        l["event"] = ev
+        l["eurl"] = f"https://kalshi.com/markets/{series}/{slug(it['title'])}/{ev.lower()}"
+        l["surl"] = f"https://kalshi.com/markets/{series}"
+
+
+def buy_block(pay, worth, edge, size, qty_notes, unit="pair"):
+    """Plain 'how much to buy' lines for trades that need the same number of every leg."""
+    sizes = sorted({min(10, size), size})
+    lines = [f"{n} {unit}{'s' if n != 1 else ''}: pay about ${pay * n / 100:.2f}, get back at least ${worth * n / 100:.2f}, "
+             f"gain about ${edge * n / 100:.2f} after fees" for n in sizes]
+    return {"intro": f"Buy the same number of every leg. The most the order books allow at these prices is {size} "
+                     f"({qty_notes}). If you buy different amounts, the extra is an unhedged bet.", "lines": lines}
+
+
+def short_rules(m):
+    t = " ".join(str(m.get("rules_primary") or "").split())
+    if re.match(r"(?i)^if\s+", t) and re.search(r"(?i),?\s*then the market resolves to yes\.?$", t):
+        t = re.sub(r"(?i)^if\s+", "", t)                              # "If X, then the market resolves to Yes." -> "X"
+        t = re.sub(r"(?i),?\s*then the market resolves to yes\.?$", "", t)
+    return t if len(t) <= 220 else t[:217].rsplit(" ", 1)[0] + "..."
+
+
 def describe(e, m):
     title = (e.get("title") or m.get("title") or m.get("ticker") or "").strip()
     sub = (m.get("yes_sub_title") or "").strip()
@@ -207,7 +239,7 @@ def build_ladders(markets):
                 ask = 100 - yb if yb is not None else None
                 flip = True
             legs.append({"k": k, "bid": bid, "ask": ask, "flip": flip, "ticker": m["ticker"],
-                         "label": m["_sub"] or fk(k), "bq": 0, "aq": 0})
+                         "label": m["_sub"] or fk(k), "bq": 0, "aq": 0, "vol": num(m, "volume_24h"), "rules": short_rules(m)})
         m0 = items[0][1]
         ladders.append({"event": ev, "cat": m0["_cat"], "title": m0["_title"],
                         "series": m0["_series"], "legs": legs})
@@ -252,6 +284,15 @@ def analyze(L, a):
     return out
 
 
+def win_text(leg):
+    """What buying this leg wins on, in the market's own words. 'Below X' markets are bought on the NO side."""
+    lab = leg["label"]
+    if not leg["flip"]:
+        return lab
+    r = re.match(r"(?i)^\s*(below|under|less than|fewer than)\s+(.*)$", lab)
+    return f"At or above {r.group(2)}" if r else f"Not \u201c{lab}\u201d"
+
+
 def flat_candidates(L, a):
     """A lower threshold that costs the same as (or less than) the next higher one, although it pays in more cases."""
     legs = [l for l in L["legs"] if l["bid"] is not None and l["ask"] is not None
@@ -268,13 +309,33 @@ def flat_candidates(L, a):
         q = 0.0   # extra coverage: what the two neighbouring ranges suggest (mid prices), capped by their mass
         if 0 < i < len(dens) - 1:
             q = min(dens[i - 1], dens[i + 1]) * (hi["k"] - lo["k"])
-            q = min(q, dens[i - 1] * (lo["k"] - legs[i - 1]["k"]), dens[i + 1] * (legs[i + 2]["k"] - hi["k"]))
+            q = min(q, dens[i - 1] * (lo["k"] - legs[i - 1]["k"]), dens[i + 1] * (legs[i + 2]["k"] - hi["k"]), a.flat_max_q)
         far = max([mids[j] for j in range(i + 2, len(legs))] or [0])
         fair = max(mids[i + 1] + q, far)
         edge = fair - lo["ask"] - fee_c(lo["ask"])
         if edge >= a.flat_min_edge:
-            out.append({"kind": "flat", "L": L, "lo": dict(lo), "hi": dict(hi), "q": q, "est": edge})
+            out.append({"kind": "flat", "L": L, "lo": dict(lo), "hi": dict(hi), "q": q, "est": edge,
+                        "pre": edge * min(max(lo.get("vol", 0), 10), 2000) / 100})
     return out
+
+
+def flat_reason(c, a):
+    """Why a same-price candidate did or did not become an alert (used by the debug panel)."""
+    lo, hi, q = c["lo"], c["hi"], c["q"]
+    if lo["ask"] is None or hi["bid"] is None or hi["ask"] is None:
+        return "no live quote on one side"
+    if lo["ask"] > hi["ask"]:
+        return f"no longer the same price: the lower tier now costs {lo['ask']}\u00a2 vs {hi['ask']}\u00a2"
+    edge = (hi["bid"] + hi["ask"]) / 2 + q - lo["ask"] - fee_c(lo["ask"])
+    if edge < a.flat_min_edge:
+        return f"value gap {edge:.2f}\u00a2 is below the {a.flat_min_edge}\u00a2 minimum"
+    if lo["aq"] < a.min_size:
+        return f"only {lo['aq']} contracts available (minimum {a.min_size})"
+    if edge * lo["aq"] / 100 < a.flat_min_profit:
+        return f"estimated profit ${edge * lo['aq'] / 100:.2f} is below the ${a.flat_min_profit} minimum"
+    if edge > a.max_edge_spec:
+        return f"dropped as implausible (edge {edge:.0f}\u00a2)"
+    return "shown"
 
 
 def flat_item(c, a):
@@ -287,14 +348,24 @@ def flat_item(c, a):
     size = lo["aq"]
     if lo["ask"] > hi["ask"] or edge < a.flat_min_edge or size < a.min_size or edge * size / 100 < a.flat_min_profit:
         return None
-    k1, k2 = fk(lo["k"]), fk(hi["k"])
+    lo_t, hi_t = win_text(lo), win_text(hi)
     action = "Buy NO" if lo["flip"] else "Buy YES"
-    return {"id": f"{lo['ticker']}|flat|{hi['ticker']}", "kind": "flat", "cat": L["cat"], "title": L["title"],
-            "headline": f"\u201c{lo['label']}\u201d costs {lo['ask']}¢, the same as \u201c{hi['label']}\u201d ({hi['ask']}¢)",
-            "why": (f"\u201c{lo['label']}\u201d pays in every case \u201c{hi['label']}\u201d does, and also when the result lands "
-                    f"between {k1} and {k2}, so it should cost more. Using the {mid_hi:.1f}¢ price of \u201c{hi['label']}\u201d as the "
-                    f"reference, it should be worth at least about {fair:.1f}¢ (roughly {q:.1f}¢ for the extra range). "
-                    f"It can be bought for {lo['ask']}¢. If you were going to buy \u201c{hi['label']}\u201d, buy this one instead."),
+    if lo["ask"] == hi["ask"]:
+        headline = f"\u201c{lo_t}\u201d and \u201c{hi_t}\u201d both cost {lo['ask']}¢, but the first wins in more cases"
+    else:
+        headline = (f"\u201c{lo_t}\u201d costs {lo['ask']}¢, less than \u201c{hi_t}\u201d ({hi['ask']}¢), "
+                    f"but it wins in more cases")
+    why = (f"\u201c{lo_t}\u201d wins whenever \u201c{hi_t}\u201d does, and also when the result lands in the gap between "
+           f"the two. So it should cost more, not the same or less. For comparison, \u201c{hi_t}\u201d is bid {hi['bid']}¢ and "
+           f"offered at {hi['ask']}¢ (about {mid_hi:.0f}¢), so \u201c{lo_t}\u201d should be worth at least about {fair:.0f}¢. "
+           f"You can buy it for {lo['ask']}¢. This is one plain purchase; nothing needs to be sold.")
+    return {"pay": lo["ask"], "worth": round(fair, 1), "sure": False,
+            "id": f"{lo['ticker']}|flat|{hi['ticker']}", "kind": "flat", "cat": L["cat"], "title": L["title"],
+            "headline": headline, "why": why,
+            "means": ((f"Buying NO on \u201c{lo['label']}\u201d wins if this does NOT happen: {lo['rules']}" if lo["flip"]
+                       else f"Buying YES on \u201c{lo['label']}\u201d wins if: {lo['rules']}") if lo.get("rules")
+                      else f"This purchase wins if the result is: {lo_t}"),
+            "refs": [{"label": hi_t, "bid": hi["bid"], "ask": hi["ask"], "note": "wins in fewer cases"}],
             "legs": [{"action": action, "ticker": lo["ticker"], "label": lo["label"], "price": lo["ask"], "qty": size}],
             "edge": round(edge, 2), "size": size, "profit": round(edge * size / 100, 2), "risk": 0, "fair": round(fair, 1),
             "url": f"https://kalshi.com/markets/{L['series'].lower()}" if L["series"] else ""}
@@ -337,9 +408,12 @@ def band_item(c, a):
              "price": 100 - hi["bid"], "qty": hi["bq"]}]
     both = 100 + cost
     if kind == "arb":
-        headline = f"Thresholds {k1} and {k2} are priced inconsistently"
-        why = (f"The two legs together cost {both:.0f}¢ and pay at least 100¢ in every outcome, "
-               f"so this locks in about {edge:.1f}¢ per contract after fees.")
+        lo_t, hi_t = win_text(lo), win_text(hi)
+        headline = f"\u201c{hi_t}\u201d is bid above what \u201c{lo_t}\u201d costs, which can't be right"
+        why = (f"\u201c{lo_t}\u201d wins whenever \u201c{hi_t}\u201d does, so it can never be worth less. Yet \u201c{hi_t}\u201d "
+               f"is bid at {hi['bid']}¢ while \u201c{lo_t}\u201d can be bought for {lo['ask']}¢. Buying both legs below "
+               f"costs {both:.0f}¢ in total and pays at least 100¢ in every outcome, so it locks in about "
+               f"{edge:.1f}¢ per contract after fees.")
     else:
         lo_mid, hi_mid = (lo["bid"] + lo["ask"]) / 2, (hi["bid"] + hi["ask"]) / 2
         headline = f"Range {k1} to {k2} looks underpriced"
@@ -348,7 +422,13 @@ def band_item(c, a):
                f"The ranges on either side imply at least {lb:.0f}% if the outcome has a single peak. "
                f"Both legs cost {both:.0f}¢ and always pay at least 100¢, plus another 100¢ if the result lands "
                f"in that range. Net risk is about {cost + fees:.1f}¢ per contract.")
-    return {"id": f"{L['event']}|{lo['ticker']}|{hi['ticker']}", "kind": kind, "cat": L["cat"],
+    lo_t2, hi_t2 = win_text(lo), win_text(hi)
+    cases = [f"Neither \u201c{lo_t2}\u201d nor \u201c{hi_t2}\u201d happens: the first leg pays 0¢ and the second pays 100¢, so you get 100¢.",
+             f"\u201c{lo_t2}\u201d happens but \u201c{hi_t2}\u201d does not: both legs pay, so you get 200¢.",
+             f"Both happen: the first leg pays 100¢ and the second pays 0¢, so you get 100¢."]
+    return {"pay": round(100 + cost), "worth": 100, "sure": kind == "arb", "cases": cases, "unit": "pair",
+            "buy": buy_block(round(100 + cost), 100, edge, size, f"{lo['aq']} of the first leg and {hi['bq']} of the second"),
+            "id": f"{L['event']}|{lo['ticker']}|{hi['ticker']}", "kind": kind, "cat": L["cat"],
             "title": L["title"], "headline": headline, "why": why, "legs": legs,
             "edge": round(edge, 2), "size": size, "profit": round(edge * size / 100, 2),
             "risk": round(cost + fees, 2), "fair": round(lb, 1),
@@ -380,7 +460,12 @@ def ladder_view(ladders, a):
                     "tiers": [{"label": l["label"], "bid": l["bid"], "ask": l["ask"]} for l in legs], "steps": steps,
                     "url": f"https://kalshi.com/markets/{L['series'].lower()}" if L["series"] else ""})
     out.sort(key=lambda x: (x["share"], x["flat"]), reverse=True)
-    return out[:150]
+    per, kept = {}, []
+    for x in out:
+        if per.get(x["cat"], 0) < a.ladders_per_cat:
+            per[x["cat"]] = per.get(x["cat"], 0) + 1
+            kept.append(x)
+    return kept[:400]
 
 
 # ---------- sets ("at most N can pay") and rank tiers ----------
@@ -419,32 +504,6 @@ def field_list(evs):
     return out
 
 
-def sets_info(fl):
-    out = []
-    for f in fl:
-        ms = list(f["subj"].values())
-        q = [quotes(m) for m in ms]
-        both = [(b, x) for b, x in q if b and x]
-        if len(both) < 3:
-            continue
-        sb, sa = sum(b for b, _ in q if b), sum(x for _, x in q if x)
-        mid = sum((b + x) / 2 for b, x in both)
-        limit = 100 * f["N"]
-        dev = (mid - limit) / limit
-        if sb > limit:
-            note = "Bids add up to more than the limit. That cannot be right, and selling every one is riskless if the sizes allow."
-        elif mid < 0.6 * limit:
-            note = (f"Prices add up to only {mid / limit * 100:.0f}% of the limit. Either unlisted contenders take "
-                    f"many of the spots, or this field is cheap.")
-        else:
-            note = f"Prices add up to {mid / limit * 100:.0f}% of the limit, which is normal."
-        out.append({"cat": f["cat"], "title": f["title"], "N": f["N"], "n": len(ms), "sum_bid": sb, "sum_ask": sa,
-                    "limit": limit, "dev": round(dev, 3), "note": note,
-                    "url": f"https://kalshi.com/markets/{f['series'].lower()}" if f["series"] else ""})
-    out.sort(key=lambda s: abs(s["dev"]), reverse=True)
-    return out[:150]
-
-
 def sum_candidates(fl, a):
     """At most N of the listed outcomes can pay, so YES bids must add up to <= 100*N."""
     out = []
@@ -476,11 +535,17 @@ def sum_item(c, books, a):
     legs = [{"action": "Buy NO", "ticker": m["ticker"], "label": m["_sub"] or m["_title"],
              "price": 100 - b, "qty": q} for m, b, q in bids]
     word = "can win" if N == 1 else f"can finish in the top {N}" if "top" in norm(f["title"]) else f"can pay"
-    return {"id": f"{f['e'].get('event_ticker')}|sum", "kind": "sum", "N": N, "cat": f["cat"], "title": f["title"],
+    pay_set = sum(100 - b for _, b, _ in bids)
+    cases = [(f"{N} of the {n} outcomes happens (the most possible)" if N == 1 else f"{N} of the {n} outcomes happen (the most possible)")
+             + f": the other {n - N} NOs pay 100¢ each, so you get {100 * (n - N)}¢.",
+             ("None happen" if N == 1 else f"Fewer than {N} happen") + f": more of the NOs pay, up to {100 * n}¢ if none happen."]
+    return {"pay": pay_set, "worth": 100 * (n - N), "sure": True, "cases": cases, "unit": "bundle (one NO on every outcome)",
+            "buy": buy_block(pay_set, 100 * (n - N), edge, size, f"{n} NO legs, one on each outcome", "bundle"),
+            "id": f"{f['e'].get('event_ticker')}|sum", "kind": "sum", "N": N, "cat": f["cat"], "title": f["title"],
             "headline": f"At most {N} of {n} outcomes can pay, but YES bids add up to {sumb}¢ (limit {100 * N}¢)",
             "why": (f"Only {N} of these {n} outcomes {word}, so their YES prices should never add up to more than "
-                    f"{100 * N}¢. They add up to {sumb}¢. Buying NO on all of them costs {100 * n - sumb}¢ per set and "
-                    f"pays at least {100 * (n - N)}¢, locking in about {edge:.1f}¢ per set after fees."),
+                    f"{100 * N}¢. They add up to {sumb}¢. Buying NO on all of them costs {100 * n - sumb}¢ per bundle (one NO on every outcome) and "
+                    f"pays at least {100 * (n - N)}¢, locking in about {edge:.1f}¢ per bundle after fees."),
             "legs": legs, "edge": round(edge, 2), "size": size, "profit": round(edge * size / 100, 2),
             "risk": 0, "fair": 0,
             "url": f"https://kalshi.com/markets/{f['series'].lower()}" if f["series"] else ""}
@@ -519,7 +584,18 @@ def tier_item(c, a):
     size = min(bg["aq"], sm["bq"])
     if edge < a.min_edge or size < a.min_size:
         return None
-    return {"id": f"{sm['ticker']}|{bg['ticker']}|tier", "kind": "tier", "cat": A["cat"],
+    pay = bg["ask"] + 100 - sm["bid"]
+    nm = c["name"]
+    a_, b_ = A["N"], B["N"]
+    c1 = f"{nm} finishes #1" if a_ == 1 else f"{nm} finishes in the top {a_}"
+    c2 = (f"{nm} finishes #{a_ + 1}" if b_ == a_ + 1 else f"{nm} finishes #{a_ + 1} to #{b_}")
+    c3 = f"{nm} finishes outside the top {b_}"
+    cases = [f"{c1}: the top-{b_} YES pays 100¢ and the top-{a_} NO pays 0¢, so you get 100¢.",
+             f"{c2}: both legs pay, so you get 200¢.",
+             f"{c3}: the top-{b_} YES pays 0¢ and the top-{a_} NO pays 100¢, so you get 100¢."]
+    return {"pay": pay, "worth": 100, "sure": True, "cases": cases, "unit": "pair",
+            "buy": buy_block(pay, 100, edge, size, f"{bg['aq']} of the YES at {bg['ask']}¢ and {sm['bq']} of the NO at {100 - sm['bid']}¢"),
+            "id": f"{sm['ticker']}|{bg['ticker']}|tier", "kind": "tier", "cat": A["cat"],
             "title": f"{c['name']}: top {A['N']} vs top {B['N']}",
             "headline": f"Priced higher to finish top {A['N']} than top {B['N']}",
             "why": (f"Finishing in the top {A['N']} means finishing in the top {B['N']}, so the top-{A['N']} price can "
@@ -797,7 +873,8 @@ def book_item(c, a):
         why = (f"Sportsbooks (median of {l['n']}, vig removed) put \u201c{desc}\u201d at {p100:.0f}%. This Kalshi "
                f"market needs an equal-or-harder result, so it should be worth at most {p100:.0f}¢, "
                f"but the market bids {price}¢ for it, which makes the opposite side cheap.")
-    return {"id": f"{m['ticker']}|book|{side}", "kind": "book", "cat": m["_cat"], "title": m["_title"],
+    return {"pay": pay, "worth": round(p100 if side == "buy" else 100 - p100, 1), "sure": False,
+            "id": f"{m['ticker']}|book|{side}", "kind": "book", "cat": m["_cat"], "title": m["_title"],
             "headline": f"Kalshi is {edge:.0f}¢ {'below' if side == 'buy' else 'above'} sportsbook prices",
             "why": why, "compare": f"{desc}: {p100:.0f}% across {l['n']} books",
             "legs": [{"action": action, "ticker": leg["ticker"], "label": leg["label"], "price": pay, "qty": size}],
@@ -807,27 +884,39 @@ def book_item(c, a):
 
 # ---------- cheap offers ----------
 def cheap_items(m, book, a):
+    """Lowest offer far below the next one AND far below where the market last traded."""
     yes, no = book
+    last = cents(m, "last_price")
+    if not last:
+        return []
     out = []
-    sides = (("Buy YES", [(100 - p, q) for p, q in no], "YES"),    # YES asks, lowest first
-             ("Buy NO", [(100 - p, q) for p, q in yes], "NO"))     # NO asks, lowest first
-    for action, asks, nm in sides:
+    rules = short_rules(m)
+    name = m["_sub"] or m["_title"]
+    sides = (("Buy YES", [(100 - p, q) for p, q in no], "YES", last),            # YES asks, lowest first
+             ("Buy NO", [(100 - p, q) for p, q in yes], "NO", 100 - last))       # NO asks, lowest first
+    for action, asks, nm, ref in sides:
         if len(asks) < 2:
             continue
         (a1, q1), (a2, _) = asks[0], asks[1]
-        if a2 - a1 >= a.ask_gap and q1 <= a.cheap_max_size and a1 >= a.cheap_min_price:
-            edge = (a2 - a1) - fee_c(a1)
-            if edge <= 0 or q1 < a.min_size:
-                continue
-            out.append({"id": f"{m['ticker']}|cheap|{nm}{a1}", "kind": "cheap", "cat": m["_cat"], "title": m["_title"],
-                        "headline": f"{nm} is offered at {a1}¢; the next offer is {a2}¢",
-                        "why": (f"The cheapest {nm} offer ({a1}¢, {q1} contracts) sits {a2 - a1}¢ below the next one "
-                                f"({a2}¢). If the real price is closer to {a2}¢, this offer is cheap by about "
-                                f"{edge:.0f}¢ after fees. It may also just be a mistake that gets pulled."),
-                        "legs": [{"action": action, "ticker": m["ticker"], "label": m["_sub"] or nm,
-                                  "price": a1, "qty": q1}],
-                        "edge": round(edge, 2), "size": q1, "profit": round(edge * q1 / 100, 2), "risk": 0, "fair": 0,
-                        "url": f"https://kalshi.com/markets/{m['_series'].lower()}" if m["_series"] else ""})
+        if a2 - a1 < a.ask_gap or q1 > a.cheap_max_size or a1 < a.cheap_min_price or ref - a1 < a.cheap_last_gap:
+            continue
+        edge = min(a2, ref) - a1 - fee_c(a1)
+        if edge <= 0 or q1 < a.min_size:
+            continue
+        wins = (f"Buying YES on \u201c{name}\u201d wins if: {rules}" if nm == "YES" and rules else
+                f"Buying NO on \u201c{name}\u201d wins if this does NOT happen: {rules}" if rules else
+                f"Buying {nm} on \u201c{name}\u201d in the market \u201c{m['_title']}\u201d.")
+        out.append({"pay": a1, "worth": min(a2, ref), "sure": False,
+                    "id": f"{m['ticker']}|cheap|{nm}{a1}", "kind": "cheap", "cat": m["_cat"], "title": m["_title"],
+                    "headline": f"{nm} on \u201c{name}\u201d can be bought for {a1}¢, but it last traded at {ref}¢",
+                    "means": wins, "note": f"Last traded at {ref}¢. The next-cheapest seller wants {a2}¢.",
+                    "why": (f"The cheapest {nm} offer ({a1}¢, {q1} contracts) is {ref - a1}¢ below the last trade ({ref}¢) "
+                            f"and {a2 - a1}¢ below the next offer ({a2}¢). If the price is really about {min(a2, ref)}¢, "
+                            f"this is cheap by roughly {edge:.0f}¢ after fees. It may also be a mistake that gets pulled, "
+                            f"or the last trade may be old."),
+                    "legs": [{"action": action, "ticker": m["ticker"], "label": name, "price": a1, "qty": q1}],
+                    "edge": round(edge, 2), "size": q1, "profit": round(edge * q1 / 100, 2), "risk": 0, "fair": 0,
+                    "url": f"https://kalshi.com/markets/{m['_series'].lower()}" if m["_series"] else ""})
     return out
 
 
@@ -978,6 +1067,17 @@ def spike_stats(log):
     return {g: {"count": len(rows), **{f"h{h}": agg(rows, h) for h in (1, 6, 24)}} for g, rows in groups.items()}
 
 
+CRYPTO_TICK = re.compile(r"^KX(?:BTC|ETH|XRP|DOGE|SHIB|CRYPTO)|^KXSOL(?:D|W|M|USD|15M)?$")
+CRYPTO_TEXT = re.compile(r"\b(?:bitcoin|btc|ethereum|solana|dogecoin|ripple|xrp|crypto|cryptocurrency|stablecoin|altcoin|nft|coinbase)\b")
+
+
+def is_crypto(e, cat):
+    if "crypto" in str(cat).lower() or CRYPTO_TICK.match(str(e.get("series_ticker") or "").upper()):
+        return True
+    ms = e.get("markets") or [{}]
+    return bool(CRYPTO_TEXT.search(norm(f"{e.get('title') or ''} {ms[0].get('title') or ''}")))
+
+
 LEAGUE_TICK = re.compile(r"(?:^|[^A-Z])(?:KX)?(?:NBA|NFL)")
 LEAGUE_TEXT = re.compile(r"\b(?:nfl|nba|pro football|pro basketball|fantasy football|super bowl|nba finals)\b")
 OTHER_TEXT = re.compile(r"\b(?:wnba|ncaa|ncaaf|ncaab|college)\b")
@@ -993,13 +1093,48 @@ def league_ok(e):
     return bool(LEAGUE_TICK.search(tick) or LEAGUE_TEXT.search(text))
 
 
-# ---------- scan ----------
+def debug_report(term, evs, ladders, flats, sel, flat_log, a):
+    """Explain what the scanner saw for markets matching a search term, and why each same-price candidate did or didn't show."""
+    t = norm(term)
+    out = {"term": term, "events": []}
+    sel_ids = {(c["lo"]["ticker"], c["hi"]["ticker"]) for c in sel}
+    for e, ms in evs:
+        blob = norm(f"{e.get('title') or ''} " + " ".join(f"{m['_title']} {m['_sub']}" for m in ms[:60]))
+        if t not in blob:
+            continue
+        tick = {m["ticker"] for m in ms}
+        rec = {"event": e.get("event_ticker"), "title": e.get("title"), "category": ms[0]["_cat"] if ms else None,
+               "n": len(ms), "markets": [], "ladders": []}
+        for m in ms[:40]:
+            yb, ya = quotes(m)
+            rec["markets"].append({"sub": m["_sub"] or m["_title"], "strike_type": m.get("strike_type") or "none",
+                                   "floor": m.get("floor_strike"), "cap": m.get("cap_strike"), "bid": yb, "ask": ya,
+                                   "recognized": bool(strike_of(m))})
+        for L in ladders:
+            if not any(l["ticker"] in tick for l in L["legs"]):
+                continue
+            usable = [l for l in L["legs"] if l["bid"] is not None and l["ask"] is not None
+                      and l["ask"] - l["bid"] <= a.max_spread]
+            cands = []
+            for c in (c for c in flats if c["L"] is L):
+                key = (c["lo"]["ticker"], c["hi"]["ticker"])
+                res = flat_log.get(key) or ("checked" if key in sel_ids else
+                                            "not checked this run: ranked below the cutoff for its topic")
+                cands.append({"pair": f"{c['lo']['label']} / {c['hi']['label']}", "value_gap": round(c["est"], 2), "result": res})
+            rec["ladders"].append({"tiers": len(L["legs"]), "usable": len(usable), "candidates": cands})
+        out["events"].append(rec)
+    return out
+
+
 def scan(a, state, now, ctx):
     events = fetch_events()
     cats = category_map(events)
-    markets, evs, excluded = [], [], 0
+    markets, evs, excluded, crypto_excluded = [], [], 0, 0
     for e in events:
         cat = e.get("category") or cats.get(e.get("series_ticker")) or "Other"
+        if not a.crypto and is_crypto(e, cat):
+            crypto_excluded += len(e.get("markets", []))
+            continue
         if a.sports != "all" and "sport" in cat.lower() and not league_ok(e):
             excluded += len(e.get("markets", []))
             continue
@@ -1019,7 +1154,6 @@ def scan(a, state, now, ctx):
         cands += analyze(L, a)
     ctx["ladders"] = ladder_view(ladders, a)
     fl = field_list(evs)
-    ctx["sets"] = sets_info(fl)
     cands += sum_candidates(fl, a)
     cands += tier_candidates(fl, a)
 
@@ -1049,9 +1183,16 @@ def scan(a, state, now, ctx):
     flats = []
     for L in ladders:
         flats += flat_candidates(L, a)
-    flats.sort(key=lambda c: c["est"], reverse=True)
+    flats.sort(key=lambda c: c["pre"], reverse=True)
+    per, sel = {}, []
+    for c in flats:   # a quota per topic, so one busy topic can't crowd out the others
+        k = c["L"]["cat"]
+        if per.get(k, 0) < a.flat_per_cat and len(sel) < a.flat_books:
+            per[k] = per.get(k, 0) + 1
+            sel.append(c)
     cands.sort(key=lambda c: c["est"], reverse=True)
-    cands = cands[:a.max_books] + flats[:a.flat_books]
+    cands = cands[:a.max_books] + sel
+    flat_log = {}
     print(f"{len(ladders)} ladders, {len(cands)} candidates to verify")
 
     need = []
@@ -1104,6 +1245,7 @@ def scan(a, state, now, ctx):
             apply_book(c["lo"], books[c["lo"]["ticker"]])
             apply_book(c["hi"], books[c["hi"]["ticker"]])
             it = flat_item(c, a)
+            flat_log[(c["lo"]["ticker"], c["hi"]["ticker"])] = flat_reason(c, a)
         elif c["kind"] == "tier":
             apply_book(c["small"], books[c["small"]["ticker"]])
             apply_book(c["big"], books[c["big"]["ticker"]])
@@ -1141,13 +1283,18 @@ def scan(a, state, now, ctx):
         it["score"] = round(it["profit"] * it["conf"], 2)
     items.sort(key=lambda x: x["score"], reverse=True)
     watch = new_markets(markets, a, now)
+    if getattr(a, "debug", None):
+        try:
+            ctx["debug"] = debug_report(a.debug, evs, ladders, flats, sel, flat_log, a)
+        except Exception as ex:
+            ctx["debug"] = {"term": a.debug, "error": f"{type(ex).__name__}: {ex}"[:200], "events": []}
     cat_stats = {}
     for m in markets:
         cat_stats.setdefault(m["_cat"], {"markets": 0, "ladders": 0, "flagged": 0})["markets"] += 1
     for L in ladders:
         cat_stats.setdefault(L["cat"], {"markets": 0, "ladders": 0, "flagged": 0})["ladders"] += 1
     return items, watch, {"events": len(events), "markets": len(markets), "ladders": len(ladders),
-                          "checked": len(cands), "books": books_info, "cats": cat_stats, "sports_excluded": excluded}
+                          "checked": len(cands), "books": books_info, "cats": cat_stats, "sports_excluded": excluded, "crypto_excluded": crypto_excluded}
 
 
 # ---------- push ----------
@@ -1177,12 +1324,17 @@ def main():
     ap.add_argument("--keep", type=int, default=200)
     ap.add_argument("--max-edge", type=float, default=60, help="drop anything with a bigger edge (cents): almost surely a data/matching error")
     ap.add_argument("--sports", default="nfl_nba", help="nfl_nba (default) or all")
+    ap.add_argument("--crypto", action="store_true", help="include crypto markets (ignored by default)")
     ap.add_argument("--max-edge-spec", type=float, default=25, help="drop shape/same-price/sportsbook items claiming more than this (cents)")
+    ap.add_argument("--flat-per-cat", type=int, default=15, help="same-price candidates verified per topic per run")
+    ap.add_argument("--ladders-per-cat", type=int, default=40, help="ladders shown per topic on the Ladders tab")
+    ap.add_argument("--flat-max-q", type=float, default=3.0, help="most value (cents) to credit for the extra range")
     ap.add_argument("--flat-min-edge", type=float, default=0.2, help="min value gap (cents) to flag a same-price tier")
     ap.add_argument("--flat-min-profit", type=float, default=0.25, help="min est. profit ($) for a same-price tier")
-    ap.add_argument("--flat-books", type=int, default=40, help="same-price tiers to verify per run")
+    ap.add_argument("--flat-books", type=int, default=100, help="same-price tiers to verify per run")
     # cheap offers
     ap.add_argument("--ask-gap", type=int, default=15, help="cents between best offer and the next one")
+    ap.add_argument("--cheap-last-gap", type=int, default=10, help="the offer must also be this far below the last trade")
     ap.add_argument("--cheap-max-size", type=int, default=500, help="max contracts at the cheap offer")
     ap.add_argument("--cheap-min-price", type=int, default=5, help="ignore offers below this many cents")
     ap.add_argument("--cheap-top", type=int, default=30, help="most-traded markets to always check for cheap offers")
@@ -1218,6 +1370,12 @@ def main():
         state = {}
     now = time.time()
     ctx = {}
+    term = (os.environ.get("DEBUG_SEARCH") or "").strip()
+    if term == "-":
+        term = ""
+    elif not term:
+        term = state.get("debug_term", "")
+    a.debug = term
     info = {"events": 0, "markets": 0, "ladders": 0, "checked": 0, "duration": None, "error": None}
     t0 = time.time()
     try:
@@ -1238,6 +1396,8 @@ def main():
     if dropped:
         print(f"dropped {len(dropped)} implausible items (edge too large):", [d["title"] for d in dropped][:5])
     items = [it for it in items if it["edge"] <= cap(it)]
+    for it in items:
+        add_links(it)
     fs = state.get("first_seen", {})
     for it in items:
         it["first_seen"] = fs.get(it["id"], now)
@@ -1254,7 +1414,8 @@ def main():
                and f"{x['ticker']}|spike|{int(now // 21600)}" not in pushed]
         if fresh or spk:
             lines = [f"{KIND_NAME[it['kind']]} | {it['cat']} | {it['title'][:70]}\n"
-                     f"{it['headline']}: +{it['edge']:.1f}¢ x {it['size']} = ${it['profit']:.2f}" for it in fresh[:5]]
+                     f"{it['headline']}\nPay {it.get('pay', it['legs'][0]['price'])}¢, gain about {it['edge']:.1f}¢ per contract"
+                     f"{'' if it.get('sure') else ' (estimate)'}; up to ${it['profit']:.2f} on {it['size']} contracts." for it in fresh[:5]]
             if len(fresh) > 5:
                 lines.append(f"+{len(fresh) - 5} more on the page")
             for x in spk[:3]:
@@ -1276,14 +1437,14 @@ def main():
     json.dump({"items": items, "watch": watch, "first_seen": {it["id"]: it["first_seen"] for it in items},
                "pushed": pushed, "err_pushed": err_pushed,
                "odds": ctx.get("odds", state.get("odds")), "odds_meter": ctx.get("odds_meter", state.get("odds_meter")),
-               "cursor": ctx.get("cursor", state.get("cursor", 0)), "ladders": ctx.get("ladders", state.get("ladders", [])), "sets": ctx.get("sets", state.get("sets", [])),
+               "cursor": ctx.get("cursor", state.get("cursor", 0)), "debug_term": term, "ladders": ctx.get("ladders", state.get("ladders", [])), 
                "base": ctx.get("base", state.get("base", {})), "spike_log": ctx.get("spike_log", state.get("spike_log", [])),
                "spikes": ctx.get("spikes", state.get("spikes", []))},
               open(STATE_PATH, "w", encoding="utf-8"), separators=(",", ":"))
     os.makedirs(SITE, exist_ok=True)
     json.dump({"updated": now, "scan": info, "items": items, "watch": watch,
-               "sets": ctx.get("sets", state.get("sets", [])), "spikes": ctx.get("spikes", state.get("spikes", [])),
-               "ladders": ctx.get("ladders", state.get("ladders", [])), "spike_stats": ctx.get("spike_stats", spike_stats(state.get("spike_log", [])))},
+               "spikes": ctx.get("spikes", state.get("spikes", [])),
+               "ladders": ctx.get("ladders", state.get("ladders", [])), "spike_stats": ctx.get("spike_stats", spike_stats(state.get("spike_log", []))), "debug": ctx.get("debug")},
               open(os.path.join(SITE, "board.json"), "w", encoding="utf-8"))
     open(os.path.join(SITE, "index.html"), "w", encoding="utf-8").write(PAGE)
     print(f"done: {len(items)} opportunities, {len(watch)} new markets, {info['ladders']} ladders, "
@@ -1348,14 +1509,15 @@ details p{margin:8px 0 0;color:var(--muted)}
 <p><b>Riskless</b>: trades that pay at least what they cost in every outcome, after fees (a higher threshold priced above a lower one, or exclusive outcomes whose YES bids add up past 100).</p>
 <p><b>Same price, more coverage</b>: a lower threshold (say "above 50") costs the same as a higher one ("above 55") even though it wins in more cases. It should cost more, so it is the cheap one. This is a plain purchase of one contract, not a spread. The value gap is usually small at prices near 97&cent; and larger in the middle of a ladder.</p>
 <p><b>Sportsbook gap</b>: Kalshi is on the wrong side of the sportsbook consensus (vig removed) by a wide margin. Totals, spreads and player props only. Books refund a player who doesn't play while Kalshi may not, so check that risk. Compare the sportsbook line on the card with the Kalshi rules before trading.</p>
-<p><b>Riskless</b> also covers <b>sets</b>: when at most N outcomes can pay (a winner list, a "top 10" list), their YES prices cannot add up to more than N x 100&cent;, and the same player cannot be priced higher for "top 1" than for "top 10". The <b>Sets</b> tab shows every such group with its total next to its limit.</p>
+<p><b>Riskless</b> also covers lists of candidates where only a few can win. For example "Top 10 TE" lists 16 players but only 10 can finish top 10, so their YES prices can't add up to more than 1,000&cent;. If they do, buying NO on every player is riskless. The same player also can't be priced higher for "top 1" than for "top 10".</p>
 <p><b>Spikes</b> are a separate idea: a price that jumped far above (or crashed far below) its recent level. The page suggests the opposite side (fade it) and shows the worst case. These are speculation, not mispricings. The track record panel measures whether fading has actually worked.</p>
 <p><b>Cheap offer</b>: the lowest offer is far below the next one in the book. It might be a mistake or might disappear before you act.</p>
-<p><b>Edge</b> is cents per contract after estimated fees. <b>Size</b> is contracts available at those exact prices. <b>Est. profit</b> = edge x size. <b>Best</b> sorting weights est. profit by how certain each type is. Prices can move before you trade, and only the top of the book is checked.</p>
+<p><b>How to read the numbers.</b> A contract pays $1 (100&cent;) if it wins and $0 if not, and its price is what you pay. <b>You pay</b> is the price now. <b>Gain per contract</b> is how many cents you expect to make on each one after fees. If the card says <i>guaranteed</i>, the trades pay at least what they cost in every outcome. If it says <i>estimate</i>, the gain depends on the market really being worth more than the price. <b>Most $ possible</b> is that gain times the contracts available at those exact prices, the ceiling if you bought everything on offer. <b>Best</b> sorting weights it by how certain each type is. Prices can move before you trade, and only the top of the book is checked.</p>
 </details>
 <details id="bk" style="display:none"></details>
 <details id="cov" style="display:none"></details>
 <details id="track" style="display:none"></details>
+<details id="dbg" style="display:none"></details>
 <div class="chips" id="tabs"></div>
 <input class="search" id="q" type="search" placeholder="Search (e.g. Rotten Tomatoes, CPI, Brunson)">
 <div class="lbl">Topic</div><div class="chips" id="cats"></div>
@@ -1368,9 +1530,9 @@ details p{margin:8px 0 0;color:var(--muted)}
 const TN={arb:"Riskless",sum:"Riskless",tier:"Riskless",flat:"Same price, more coverage",shape:"Likely mispriced",book:"Sportsbook gap",cheap:"Cheap offer"};
 const GRP={arb:"safe",sum:"safe",tier:"safe",flat:"flat",shape:"shape",book:"book",cheap:"cheap"};
 const TYPES=[["safe","Riskless"],["flat","Same price, more coverage"],["book","Sportsbook gap"],["cheap","Cheap offer"]];
-const SORTS=[["score","Best"],["profit","Est. profit"],["edge","Edge"],["new","Newest"]];
+const SORTS=[["score","Best"],["profit","Most $ possible"],["edge","Gain per contract"],["new","Newest"]];
 let S={tab:"opps",cat:"ALL",type:"ALL",sort:"score",q:""},data=null;
-try{const x=JSON.parse(localStorage.getItem("kalshi-board2")||"{}");S.cat=x.cat||"ALL";S.type=x.type||"ALL";S.sort=x.sort||"score";S.tab=x.tab||"opps"}catch(e){}
+try{const x=JSON.parse(localStorage.getItem("kalshi-board2")||"{}");S.cat=x.cat||"ALL";S.type=x.type||"ALL";S.sort=x.sort||"score";S.tab=x.tab||"opps";if(S.tab==="sets")S.tab="opps"}catch(e){}
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const ago=t=>{const s=Math.max(0,Math.round(Date.now()/1000-t));
  return s<90?s+"s":s<5400?Math.round(s/60)+" min":s<172800?Math.round(s/3600)+" h":Math.round(s/86400)+" d"};
@@ -1381,18 +1543,31 @@ const okurl=u=>(u||"").indexOf("https://kalshi.com/")===0?u:"";
 function card(i){
  const url=okurl(i.url);
  const legs=i.legs.slice(0,12).map(l=>'<div class="leg"><b>'+esc(l.action)+'</b><span>'+esc(l.label)+'</span><span class="px">'+l.price+
-  '&cent;</span><span class="q">'+l.qty+' avail</span></div>').join("")+(i.legs.length>12?'<div class="leg"><span class="q">+'+(i.legs.length-12)+' more legs</span></div>':"");
- const second=i.kind==="shape"?'<div class="num"><b>$'+i.profit.toFixed(2)+'</b><span>est. profit</span></div>':
+  '&cent;</span><span class="q">'+l.qty+' avail</span></div>'+
+  '<div class="leg" style="font-size:12px;padding-top:0"><span class="tk">'+esc(l.ticker)+'</span>'+
+  (okurl(l.eurl)?'<a href="'+esc(l.eurl)+'" target="_blank" rel="noopener" style="color:var(--blue)">event page</a>':"")+
+  (okurl(l.surl)?'<a href="'+esc(l.surl)+'" target="_blank" rel="noopener" style="color:var(--blue)">series page</a>':"")+'</div>').join("")+
+  (i.legs.length>12?'<div class="leg"><span class="q">+'+(i.legs.length-12)+' more legs</span></div>':"");
+ const multi=i.legs.length>1,sure=i.sure===true;
+ const pay=i.pay!=null?i.pay:i.legs[0].price,worth=i.worth!=null?i.worth:null;
+ const k=Math.max(1,Math.min(i.size,100));
+ const box1='<div class="num"><b>'+pay+'&cent;</b><span>'+(multi?'you pay, all legs together':'you pay per contract')+'</span></div>';
+ const box2=worth!=null?'<div class="num"><b>'+(sure?'at least ':'about ')+worth+'&cent;</b><span>'+(sure?'you get back, guaranteed':'what it is worth (estimate)')+'</span></div>':
   '<div class="num"><b>'+i.size+'</b><span>contracts available</span></div>';
- const third=i.kind==="shape"?'<div class="num"><b>'+i.risk.toFixed(1)+'&cent;</b><span>risked per contract</span></div>':
-  '<div class="num"><b>$'+i.profit.toFixed(2)+'</b><span>est. profit</span></div>';
+ const box3='<div class="num"><b>+'+i.edge.toFixed(1)+'&cent;</b><span>'+(sure?'guaranteed gain, after fees':'estimated gain, not guaranteed')+'</span></div>';
+ const money='<div class="cmp">Buying '+k+' contract'+(k===1?'':'s')+': you pay about $'+(pay*k/100).toFixed(2)+' and '+(sure?'gain about $':'would gain about $')+(i.edge*k/100).toFixed(2)+
+  (sure?'':' if the estimate is right')+'. All '+i.size+' available at these prices: about $'+i.profit.toFixed(2)+'.</div>';
  return '<div class="card '+esc(i.kind)+'"><div class="top"><span class="kind">'+esc(TN[i.kind]||i.kind)+'</span><span class="cat">'+esc(i.cat)+
   '</span><span class="age">seen '+ago(i.first_seen)+'</span></div><div class="title">'+esc(i.title)+'</div><div class="head">'+esc(i.headline)+'</div>'+
-  '<div class="nums"><div class="num"><b>+'+i.edge.toFixed(1)+'&cent;</b><span>edge per contract</span></div>'+second+third+'</div>'+
-  (i.kind==="shape"?'<div class="head" style="margin:-2px 0 8px">'+i.size+' contracts available at these prices</div>':"")+
-  '<div class="trade">'+legs+'</div>'+(i.compare?'<div class="cmp"><b>Sportsbooks:</b> '+esc(i.compare)+'</div>':"")+
+  (i.means?'<div class="cmp" style="margin-top:6px"><b>What this means:</b> '+esc(i.means)+'</div>':"")+
+  '<div class="nums">'+box1+box2+box3+'</div>'+
+  '<div class="trade">'+legs+'</div>'+
+  (i.cases?'<div class="cmp"><b>What you get in each case</b> (you pay '+pay+'&cent; per '+esc(i.unit||"pair")+' in total):<ul style="margin:6px 0 0 18px;padding:0">'+i.cases.map(c=>'<li>'+esc(c)+'</li>').join("")+'</ul></div>':"")+
+  (i.buy?'<div class="cmp"><b>How much to buy:</b> '+esc(i.buy.intro)+'<ul style="margin:6px 0 0 18px;padding:0">'+i.buy.lines.map(c=>'<li>'+esc(c)+'</li>').join("")+'</ul></div>':money)+(i.note?'<div class="cmp">'+esc(i.note)+'</div>':"")+
+  (i.compare?'<div class="cmp"><b>Sportsbooks:</b> '+esc(i.compare)+'</div>':"")+
+  (i.refs?i.refs.map(r=>'<div class="cmp"><b>For comparison:</b> '+esc(r.label)+' is bid '+r.bid+'&cent; and offered at '+r.ask+'&cent; ('+esc(r.note)+')</div>').join(""):"")+
   '<div class="why">'+esc(i.why)+'</div>'+
-  (url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
+  (!i.legs[0].eurl&&url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
 function wcard(w){
  const url=okurl(w.url);
  const px=(w.bid||w.ask)?("Bid "+(w.bid?w.bid+"\u00a2":"none")+" \u00b7 Ask "+(w.ask?w.ask+"\u00a2":"none")):"No prices yet";
@@ -1427,6 +1602,21 @@ function spcard(x){
   '<div class="trade"><div class="leg"><b>'+esc(l.action)+'</b><span>'+esc(l.label)+'</span><span class="px">'+l.price+'&cent;</span><span class="q">'+l.qty+' avail</span></div></div>'+
   '<div class="why">Fade idea, not a guaranteed edge. Spikes on thin volume with nothing else moving are more likely noise or a single eager buyer. Spikes on heavy volume, or where related markets moved, are more likely real news, and fading real news loses.</div>'+
   (url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
+function debugPanel(){
+ const el=document.getElementById("dbg"),d=data.debug;
+ if(!d){el.style.display="none";return}
+ el.style.display="";
+ let h="<summary>Debug: what the scanner saw for \u201c"+esc(d.term)+"\u201d</summary>";
+ if(d.error)h+='<p class="bad">'+esc(d.error)+"</p>";
+ if(!d.events.length)h+="<p>No open Kalshi event matched that text. Check the spelling, or the market may not be in the open-events list.</p>";
+ d.events.forEach(e=>{
+  h+="<p><b>"+esc(e.title)+"</b> ("+esc(e.event)+", topic: "+esc(e.category)+", "+e.n+" markets)</p>";
+  h+="<p>"+e.markets.map(m=>esc(m.sub)+" \u00b7 strike_type "+esc(m.strike_type)+" "+(m.floor!=null?"floor "+m.floor:"")+(m.cap!=null?" cap "+m.cap:"")+" \u00b7 bid "+(m.bid==null?"-":m.bid)+" / ask "+(m.ask==null?"-":m.ask)+" \u00b7 "+(m.recognized?"recognized as a threshold":"NOT recognized as a threshold")).join("<br>")+"</p>";
+  if(!e.ladders.length)h+="<p>No price ladder was built from this event.</p>";
+  e.ladders.forEach(l=>{
+   h+="<p>Ladder: "+l.tiers+" tiers, "+l.usable+" with usable quotes. "+(l.candidates.length?"Same-price candidates:<br>"+l.candidates.map(c=>esc(c.pair)+" \u00b7 value gap "+c.value_gap+"\u00a2 \u00b7 <b>"+esc(c.result)+"</b>").join("<br>"):"No same-price candidates.")+"</p>"})
+ });
+ el.innerHTML=h}
 function track(){
  const el=document.getElementById("track"),t=data.spike_stats;
  if(S.tab!=="spikes"||!t){el.style.display="none";return}
@@ -1436,14 +1626,6 @@ function track(){
   return "<p><b>"+name+"</b> ("+g.count+" logged)<br>After 1 h: "+cell("h1")+"<br>After 6 h: "+cell("h6")+"<br>After 24 h: "+cell("h24")+"</p>"};
  el.innerHTML="<summary>Track record: did these spikes actually fade?</summary><p>Every spike the scanner sees is logged, and its price is checked again 1, 6 and 24 hours later. Retrace 100% means back to the pre-spike level; below 0% means it kept going.</p>"+
   row("Thin volume, nothing else moved",t.thin_iso)+row("All other spikes",t.other)+(t.all.count?"":"<p>Nothing logged yet. Outcomes fill in as time passes.</p>")}
-function scard(x){
- const url=okurl(x.url);
- return '<div class="card set"><div class="top"><span class="kind" style="color:var(--muted)">Set</span><span class="cat">'+esc(x.cat)+
-  '</span><span class="age">'+x.n+' listed</span></div><div class="title">'+esc(x.title)+'</div>'+
-  '<div class="head">At most '+x.N+' of these can pay out, so prices should not add up to more than '+x.limit+'&cent;.</div>'+
-  '<div class="nums"><div class="num"><b>'+x.sum_bid+'&cent;</b><span>YES bids add up to</span></div><div class="num"><b>'+x.sum_ask+
-  '&cent;</b><span>YES asks add up to</span></div><div class="num"><b>'+x.limit+'&cent;</b><span>limit</span></div></div>'+
-  '<div class="why">'+esc(x.note)+'</div>'+(url?'<div class="meta"><a href="'+esc(url)+'" target="_blank" rel="noopener">Open on Kalshi</a></div>':"")+'</div>'}
 function books(){
  const el=document.getElementById("bk"),b=data.scan.books;
  if(!b){el.style.display="none";return}
@@ -1464,7 +1646,8 @@ function coverage(){
  el.style.display="";
  el.innerHTML="<summary>Coverage by topic</summary>"+Object.keys(c).sort((x,y)=>c[y].markets-c[x].markets).map(k=>
   "<p><b>"+esc(k)+"</b>: "+c[k].markets.toLocaleString()+" markets, "+c[k].ladders+" price ladders, "+(c[k].flagged||0)+" flagged</p>").join("")+
-  (data.scan.sports_excluded?"<p>Sports are limited to NFL and NBA. "+data.scan.sports_excluded.toLocaleString()+" markets in other sports are ignored.</p>":"")}
+  (data.scan.sports_excluded?"<p>Sports are limited to NFL and NBA. "+data.scan.sports_excluded.toLocaleString()+" markets in other sports are ignored.</p>":"")+
+  (data.scan.crypto_excluded?"<p>Crypto is ignored: "+data.scan.crypto_excluded.toLocaleString()+" markets skipped.</p>":"")}
 function emptyMsg(){
  const c=(data.scan.cats||{})[S.cat];
  if(S.cat!=="ALL"&&c)return "Scanned "+c.markets.toLocaleString()+" "+esc(S.cat)+" markets and "+c.ladders+" price ladders in this topic. Nothing flagged right now.";
@@ -1477,19 +1660,18 @@ function render(){
  if(sc.error)sub+='<br><span class="bad">Last scan failed: '+esc(sc.error)+'</span>';
  else if(!sc.ladders)sub+='<br><span class="warn">No ladders were detected. The strike data may have a different format than expected.</span>';
  document.getElementById("sub").innerHTML=sub;
- books();coverage();track();
+ books();coverage();track();debugPanel();
  const tb=document.getElementById("tabs");tb.innerHTML="";
  tb.appendChild(chip("Opportunities",data.items.length,S.tab==="opps",()=>{S.tab="opps";save();render()}));
  tb.appendChild(chip("Ladders",(data.ladders||[]).length,S.tab==="ladders",()=>{S.tab="ladders";save();render()}));
  tb.appendChild(chip("Spikes",(data.spikes||[]).length,S.tab==="spikes",()=>{S.tab="spikes";save();render()}));
- tb.appendChild(chip("Sets",(data.sets||[]).length,S.tab==="sets",()=>{S.tab="sets";save();render()}));
  tb.appendChild(chip("New markets",watch.length,S.tab==="new",()=>{S.tab="new";save();render()}));
  const opps=S.tab==="opps";
  document.getElementById("typewrap").style.display=opps?"":"none";
  document.getElementById("sortwrap").style.display=opps?"":"none";
  const q=S.q.trim().toLowerCase();
- const pool=opps?data.items:S.tab==="sets"?(data.sets||[]):S.tab==="spikes"?(data.spikes||[]):S.tab==="ladders"?(data.ladders||[]):watch;
- const text=i=>opps?(i.title+" "+i.headline+" "+i.cat+" "+i.legs.map(l=>l.label+" "+l.ticker).join(" ")):S.tab==="sets"||S.tab==="ladders"?(i.title+" "+i.cat):(i.title+" "+(i.sub||"")+" "+i.cat+" "+i.ticker);
+ const pool=opps?data.items:S.tab==="spikes"?(data.spikes||[]):S.tab==="ladders"?(data.ladders||[]):watch;
+ const text=i=>opps?(i.title+" "+i.headline+" "+i.cat+" "+i.legs.map(l=>l.label+" "+l.ticker).join(" ")):S.tab==="ladders"?(i.title+" "+i.cat):(i.title+" "+(i.sub||"")+" "+i.cat+" "+i.ticker);
  const base=pool.filter(i=>!q||text(i).toLowerCase().includes(q));
  const byType=opps?base.filter(i=>S.type==="ALL"||GRP[i.kind]===S.type):base;
  const cov=sc.cats||{};
@@ -1509,8 +1691,8 @@ function render(){
  }
  const list=byCat.filter(i=>!opps||S.type==="ALL"||GRP[i.kind]===S.type);
  if(opps)list.sort((x,y)=>S.sort==="edge"?y.edge-x.edge:S.sort==="profit"?y.profit-x.profit:S.sort==="new"?y.first_seen-x.first_seen:y.score-x.score);
- document.getElementById("count").textContent=opps?list.length+" opportunit"+(list.length===1?"y":"ies"):S.tab==="sets"?list.length+" sets where only some outcomes can pay (largest deviation from the limit first)":S.tab==="spikes"?list.length+" recent price spikes (thin, unconfirmed moves first)":S.tab==="ladders"?list.length+" ladders with tiers priced the same (widest flat stretches first). Each step shows how much chance the market gives to that range.":list.length+" newly opened, unpriced or wide-spread markets (newest first)";
- document.getElementById("feed").innerHTML=list.length?list.map(opps?card:S.tab==="sets"?scard:S.tab==="spikes"?spcard:S.tab==="ladders"?lcard:wcard).join(""):
+ document.getElementById("count").textContent=opps?list.length+" opportunit"+(list.length===1?"y":"ies"):S.tab==="spikes"?list.length+" recent price spikes (thin, unconfirmed moves first)":S.tab==="ladders"?list.length+" ladders with tiers priced the same (widest flat stretches first). Each step shows how much chance the market gives to that range.":list.length+" newly opened, unpriced or wide-spread markets (newest first)";
+ document.getElementById("feed").innerHTML=list.length?list.map(opps?card:S.tab==="spikes"?spcard:S.tab==="ladders"?lcard:wcard).join(""):
   '<div class="empty">'+emptyMsg()+'</div>';
 }
 document.getElementById("q").addEventListener("input",e=>{S.q=e.target.value;render()});
