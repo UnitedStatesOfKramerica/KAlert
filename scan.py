@@ -1078,6 +1078,21 @@ def is_crypto(e, cat):
     return bool(CRYPTO_TEXT.search(norm(f"{e.get('title') or ''} {ms[0].get('title') or ''}")))
 
 
+FILM_TEXT = re.compile(r"\b(?:rotten tomatoes|box office|opening weekend|cinemascore|imdb|movie|movies|film|films|oscar|oscars|"
+                       r"academy awards?|emmy|emmys|golden globes?|bafta|sag awards?|critics choice|tv|television|netflix|hbo|"
+                       r"disney|hulu|streaming|episode|episodes|season finale|premiere|trailer|sequel|marvel|star wars)\b")
+ENT_CATS = {"entertainment", "culture", "pop culture", "media", "arts"}
+
+
+def refine_cat(e, cat):
+    """Split movies and TV out of Entertainment so they get their own topic chip."""
+    ms = e.get("markets") or [{}]
+    text = norm(f"{e.get('title') or ''} {ms[0].get('title') or ''} {e.get('series_ticker') or ''}")
+    if (str(cat).lower() in ENT_CATS or "rotten tomatoes" in text) and FILM_TEXT.search(text):
+        return "Film/TV"
+    return cat
+
+
 LEAGUE_TICK = re.compile(r"(?:^|[^A-Z])(?:KX)?(?:NBA|NFL)")
 LEAGUE_TEXT = re.compile(r"\b(?:nfl|nba|pro football|pro basketball|fantasy football|super bowl|nba finals)\b")
 OTHER_TEXT = re.compile(r"\b(?:wnba|ncaa|ncaaf|ncaab|college)\b")
@@ -1132,6 +1147,7 @@ def scan(a, state, now, ctx):
     markets, evs, excluded, crypto_excluded = [], [], 0, 0
     for e in events:
         cat = e.get("category") or cats.get(e.get("series_ticker")) or "Other"
+        cat = refine_cat(e, cat)
         if not a.crypto and is_crypto(e, cat):
             crypto_excluded += len(e.get("markets", []))
             continue
